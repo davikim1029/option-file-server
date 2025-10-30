@@ -1,3 +1,4 @@
 uvicorn
 fastapi
--e ~/GitHub/options/options-shared/
+python-multipart
+-e /home/dkim/GitHub/options/options-shared/
