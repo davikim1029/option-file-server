@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from typing import List
 
 # Where JSON files will be saved
-SAVE_DIR = Path("/Users/daviskim/Documents/GitHub/options/Server/data")
+SAVE_DIR = Path("data")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Option Data Ingest Server")
@@ -22,15 +22,13 @@ app = FastAPI()
 @app.post("/api/upload_file")
 async def upload_file(file: UploadFile = File(...)):
     try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{file.filename.split('.')[0]}_{timestamp}.json"
-        filepath = SAVE_DIR / filename
+        filepath = SAVE_DIR / file.filename
 
         # Write uploaded file to target folder
         with filepath.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        return {"status": "ok", "filename": str(filename)}
+        return {"status": "ok", "filename": str(file.filename)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
