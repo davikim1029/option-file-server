@@ -1,0 +1,3 @@
+uvicorn
+fastapi
+-e ~/GitHub/options/options-shared/
