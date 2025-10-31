@@ -3,9 +3,10 @@ from pathlib import Path
 import shutil
 import threading
 import time
-from shared_options import OptionFeature
-from pydantic import BaseModel
+from contextlib import asynccontextmanager
 from typing import List
+from pydantic import BaseModel
+from shared_options import OptionFeature
 from processor import OptionDataProcessor
 
 # -----------------------------
@@ -14,56 +15,88 @@ from processor import OptionDataProcessor
 SAVE_DIR = Path("data")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = "database/options.db"
+DB_PATH = Path("database/options.db")
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 CHECK_INTERVAL = 5  # seconds
+LOG_FILE = Path("option_server.log")
+MAX_LOG_LINES = 10000  # Keep last 10k lines
 
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="Option Data Ingest Server")
-
 class OptionFeatureBatch(BaseModel):
     options: List[OptionFeature]
 
 # -----------------------------
-# File Watcher
+# File watcher function
 # -----------------------------
 def file_watcher():
     processor = OptionDataProcessor(
-        db_path=DB_PATH,
+        db_path=str(DB_PATH),
         incoming_folder=SAVE_DIR
     )
 
     while True:
-        # Find all JSON files in the folder
         for file in SAVE_DIR.glob("*.json"):
             print(f"Processing {file}")
             try:
                 processor.ingest_file(file)
-                # Delete after ingestion to save space
+                # Delete after ingestion
                 file.unlink()
             except Exception as e:
                 print(f"Error processing {file}: {e}")
         time.sleep(CHECK_INTERVAL)
 
-@app.on_event("startup")
-def startup_event():
+# -----------------------------
+# Log trimming function
+# -----------------------------
+def trim_log():
+    if not LOG_FILE.exists():
+        return
+    with LOG_FILE.open("r") as f:
+        lines = f.readlines()
+    if len(lines) > MAX_LOG_LINES:
+        # Keep only the last MAX_LOG_LINES
+        with LOG_FILE.open("w") as f:
+            f.writelines(lines[-MAX_LOG_LINES:])
+
+def log_monitor():
+    while True:
+        trim_log()
+        time.sleep(60)  # check every 60 seconds
+
+# -----------------------------
+# Lifespan for FastAPI
+# -----------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start file watcher thread
     watcher_thread = threading.Thread(target=file_watcher, daemon=True)
     watcher_thread.start()
     print("File watcher started")
 
+    # Start log monitor thread
+    log_thread = threading.Thread(target=log_monitor, daemon=True)
+    log_thread.start()
+    print("Log monitor started")
+
+    yield  # FastAPI app runs here
+
+    # Optional cleanup on shutdown
+    print("Server shutting down...")
+
+app = FastAPI(title="Option Data Ingest Server", lifespan=lifespan)
+
 # -----------------------------
-# API Endpoint
+# API endpoint
 # -----------------------------
 @app.post("/api/upload_file")
 async def upload_file(file: UploadFile = File(...)):
     try:
         filepath = SAVE_DIR / file.filename
-
-        # Write uploaded file to SAVE_DIR
         with filepath.open("wb") as f:
             shutil.copyfileobj(file.file, f)
-
         return {"status": "ok", "filename": str(file.filename)}
     except Exception as e:
         return {"status": "error", "message": str(e)}

@@ -4,7 +4,6 @@ python-multipart
 pydantic>=2.0
 numpy>=1.25
 pandas>=2.0
-sqlite3  # comes built-in with Python, no need to install
 APScheduler>=3.10
 watchdog>=3.0  # if you want live folder watching
 fastapi

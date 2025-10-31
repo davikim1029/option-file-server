@@ -6,14 +6,21 @@ from pathlib import Path
 import time
 import logging
 from logging.handlers import RotatingFileHandler
+from collections import deque
+from get_recent_rows import get_last_30_rows  # your helper for DB rows
 
+# -----------------------------
+# Paths & Constants
+# -----------------------------
 PID_FILE = Path("option_server.pid")
 LOG_FILE = Path("option_server.log")
+DB_PATH = Path("database/options.db")
 
 # Max log file size 5 MB, keep 3 backups
 MAX_LOG_SIZE = 5 * 1024 * 1024
 BACKUP_COUNT = 3
 
+# uvicorn command to start FastAPI server
 UVICORN_CMD = [
     sys.executable, "-m", "uvicorn",
     "option_server:app",
@@ -24,22 +31,20 @@ UVICORN_CMD = [
 
 RESTART_DELAY = 2  # seconds before auto-restart if crashed
 
-# ---------------------
-# Setup rotating logger
-# ---------------------
+# -----------------------------
+# Setup Rotating Logger
+# -----------------------------
 logger = logging.getLogger("OptionServer")
 logger.setLevel(logging.INFO)
-
 LOG_FILE.parent.mkdir(exist_ok=True)
 handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-
-# ---------------------
-# Helper functions
-# ---------------------
+# -----------------------------
+# Helper Functions
+# -----------------------------
 def is_server_running():
     if not PID_FILE.exists():
         return False
@@ -51,11 +56,13 @@ def is_server_running():
         PID_FILE.unlink(missing_ok=True)
         return False
 
-
 def start_server():
     if is_server_running():
         print("Server is already running.")
         return
+
+    if PID_FILE.exists():
+        PID_FILE.unlink(missing_ok=True)
 
     with LOG_FILE.open("a") as log_file:
         process = subprocess.Popen(
@@ -66,7 +73,6 @@ def start_server():
     PID_FILE.write_text(str(process.pid))
     print(f"Server started with PID {process.pid}, logging to {LOG_FILE}")
 
-
 def stop_server():
     if not PID_FILE.exists():
         print("No PID file found. Server may not be running.")
@@ -76,6 +82,7 @@ def stop_server():
     try:
         os.kill(pid, signal.SIGTERM)
         print(f"Sent SIGTERM to server PID {pid}")
+        # wait for process to terminate
         for _ in range(10):
             time.sleep(0.5)
             os.kill(pid, 0)
@@ -84,7 +91,6 @@ def stop_server():
     PID_FILE.unlink(missing_ok=True)
     print("Server stopped.")
 
-
 def check_server():
     if is_server_running():
         pid = int(PID_FILE.read_text())
@@ -92,9 +98,8 @@ def check_server():
     else:
         print("Server is not running.")
 
-
 def monitor_loop():
-    """Run the server continuously, restarting if it crashes."""
+    """Continuously monitor the server and restart if it crashes."""
     while True:
         if is_server_running():
             logger.info("Server already running. Monitor sleeping...")
@@ -102,6 +107,9 @@ def monitor_loop():
             continue
 
         logger.info(f"Starting server at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if PID_FILE.exists():
+            PID_FILE.unlink(missing_ok=True)
+
         with LOG_FILE.open("a") as log_file:
             process = subprocess.Popen(
                 UVICORN_CMD,
@@ -114,7 +122,23 @@ def monitor_loop():
         logger.warning(f"Server exited, restarting in {RESTART_DELAY}s...")
         time.sleep(RESTART_DELAY)
 
+# -----------------------------
+# Utility: Tail log
+# -----------------------------
+def tail_log(file_path: Path, n: int = 10):
+    if not file_path.exists():
+        print(f"Log file not found: {file_path}")
+        return
 
+    with file_path.open("r") as f:
+        last_lines = deque(f, maxlen=n)
+
+    for line in last_lines:
+        print(line, end='')
+
+# -----------------------------
+# Main Menu
+# -----------------------------
 def main():
     while True:
         print("\nOption Server Manager")
@@ -122,7 +146,9 @@ def main():
         print("2) Stop Server")
         print("3) Check Server Status")
         print("4) Run Auto-Restart Monitor (blocks terminal)")
-        print("5) Exit")
+        print("5) Check last 30 database rows")
+        print("6) Tail last 10 server log lines")
+        print("7) Exit")
         choice = input("Select an option: ").strip()
 
         if choice == "1":
@@ -138,10 +164,13 @@ def main():
             except KeyboardInterrupt:
                 print("Monitor loop exited.")
         elif choice == "5":
+            get_last_30_rows()
+        elif choice == "6":
+            tail_log(LOG_FILE)
+        elif choice == "7":
             break
         else:
             print("Invalid choice, try again.")
-
 
 if __name__ == "__main__":
     main()
