@@ -135,8 +135,6 @@ class OptionAnalyticsProcessor:
                     startPrice, endPrice, totalChange, avgIV, maxIV, minIV, len(rows)
                 ))
 
-                self.logger.logMessage(f"Archived lifespan for {osiKey}")
-
             conn.commit()
             conn.close()
             self.logger.logMessage("Processed all completed options")
