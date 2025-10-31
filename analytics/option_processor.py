@@ -20,7 +20,7 @@ class OptionAnalyticsProcessor:
 
     def _init_lifespan_table(self):
         """Create the derived analytics table if it doesn’t exist."""
-        self.logger.logMessage("Creating Lifespan database if doesn't exist")
+        self.logger.logMessage("Creating Lifespan database if it doesn't exist")
         try:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
@@ -38,15 +38,26 @@ class OptionAnalyticsProcessor:
                     avgIV REAL,
                     maxIV REAL,
                     minIV REAL,
+                    avgDelta REAL,
+                    avgGamma REAL,
+                    avgTheta REAL,
+                    avgVega REAL,
+                    avgRho REAL,
+                    avgBidAskSpread REAL,
+                    avgVolume REAL,
+                    avgOpenInterest REAL,
+                    avgMidPrice REAL,
+                    avgMoneyness REAL,
                     totalSnapshots INTEGER
                 )
             """)
             conn.commit()
             conn.close()
-            self.logger.logMessage("Lifespan Database created/exists")
+            self.logger.logMessage("Lifespan Database created / exists")
         except Exception as e:
             self.logger.logMessage("Error creating lifespan database")
-            self.logger.logMessage(e)
+            self.logger.logMessage(str(e))
+
             
 
 
@@ -79,34 +90,34 @@ class OptionAnalyticsProcessor:
                 self.logger.logMessage(f"[Analytics] Error in analytics loop: {e}")
             time.sleep(self.check_interval)
 
-    # -------------------------------
-    # Core Analytics Logic
-    # -------------------------------
-    def process_completed_options(self):
+        # -------------------------------
+        # Core Analytics Logic
+        # -------------------------------
+    def process_completed_options(self, min_lifespan_days: int = 5):
         try:
             self.logger.logMessage("Processing completed options")
-            """Find options where daysToExpiration <= 0 and archive their lifespan data."""
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
 
-            # Get all osiKeys that have expired in all their snapshots
+            # Step 1: Find all fully expired options
             c.execute("""
-                SELECT osiKey, symbol, optionType, strikePrice
+                SELECT osiKey
                 FROM option_snapshots
                 GROUP BY osiKey
                 HAVING MAX(daysToExpiration) <= 0
             """)
-            completed = c.fetchall()
+            completed = [row[0] for row in c.fetchall()]
 
-            for osiKey, symbol, optionType, strike in completed:
+            for osiKey in completed:
                 # Skip if already archived
                 c.execute("SELECT 1 FROM option_lifespans WHERE osiKey = ?", (osiKey,))
                 if c.fetchone():
                     continue
 
-                # Fetch full history for this option
+                # Step 2: Fetch all snapshots
                 c.execute("""
-                    SELECT timestamp, lastPrice, iv
+                    SELECT timestamp, lastPrice, iv, delta, gamma, theta, vega, rho, bid, ask,
+                        volume, openInterest, midPrice, moneyness
                     FROM option_snapshots
                     WHERE osiKey = ?
                     ORDER BY timestamp ASC
@@ -115,35 +126,81 @@ class OptionAnalyticsProcessor:
                 if not rows:
                     continue
 
-                startDate = rows[0][0]
-                endDate = rows[-1][0]
-                startPrice = rows[0][1]
-                endPrice = rows[-1][1]
-                totalChange = endPrice - startPrice
+                start_ts = datetime.fromisoformat(rows[0][0])
+                end_ts = datetime.fromisoformat(rows[-1][0])
+                lifespan_days = (end_ts - start_ts).days
 
+                # Step 3: Skip / delete options shorter than minimum lifespan
+                if lifespan_days < min_lifespan_days:
+                    self.logger.logMessage(f"Skipping short-lived option {osiKey} ({lifespan_days} days)")
+                    c.execute("DELETE FROM option_snapshots WHERE osiKey = ?", (osiKey,))
+                    continue
+
+                # Step 4: Aggregate statistics
+                last_prices = [r[1] for r in rows]
                 iv_values = [r[2] for r in rows if r[2] is not None]
-                avgIV = sum(iv_values) / len(iv_values) if iv_values else None
-                maxIV = max(iv_values) if iv_values else None
-                minIV = min(iv_values) if iv_values else None
+                deltas = [r[3] for r in rows]
+                gammas = [r[4] for r in rows]
+                thetas = [r[5] for r in rows]
+                vegas = [r[6] for r in rows]
+                rhos = [r[7] for r in rows]
+                bids = [r[8] for r in rows]
+                asks = [r[9] for r in rows]
+                volumes = [r[10] for r in rows]
+                open_interests = [r[11] for r in rows]
+                mid_prices = [r[12] for r in rows if r[12] is not None]
+                moneyness = [r[13] for r in rows if r[13] is not None]
 
+                avg_bid_ask_spread = sum([a - b for a, b in zip(asks, bids)]) / len(rows)
+
+                lifespan_record = (
+                    osiKey,
+                    rows[0][1],  # symbol
+                    rows[0][2],  # optionType
+                    rows[0][3],  # strikePrice
+                    start_ts.isoformat(),
+                    end_ts.isoformat(),
+                    last_prices[0],  # startPrice
+                    last_prices[-1],  # endPrice
+                    last_prices[-1] - last_prices[0],  # totalChange
+                    sum(iv_values)/len(iv_values) if iv_values else None,
+                    max(iv_values) if iv_values else None,
+                    min(iv_values) if iv_values else None,
+                    sum(deltas)/len(deltas),
+                    sum(gammas)/len(gammas),
+                    sum(thetas)/len(thetas),
+                    sum(vegas)/len(vegas),
+                    sum(rhos)/len(rhos),
+                    avg_bid_ask_spread,
+                    sum(volumes)/len(volumes),
+                    sum(open_interests)/len(open_interests),
+                    sum(mid_prices)/len(mid_prices) if mid_prices else None,
+                    sum(moneyness)/len(moneyness) if moneyness else None,
+                    len(rows)
+                )
+
+                # Step 5: Insert aggregated record into lifespan table
                 c.execute("""
                     INSERT OR REPLACE INTO option_lifespans (
                         osiKey, symbol, optionType, strikePrice,
-                        startDate, endDate, startPrice, endPrice,
-                        totalChange, avgIV, maxIV, minIV, totalSnapshots
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    osiKey, symbol, optionType, strike, startDate, endDate,
-                    startPrice, endPrice, totalChange, avgIV, maxIV, minIV, len(rows)
-                ))
+                        startDate, endDate, startPrice, endPrice, totalChange,
+                        avgIV, maxIV, minIV, avgDelta, avgGamma, avgTheta, avgVega, avgRho,
+                        avgBidAskSpread, avgVolume, avgOpenInterest, avgMidPrice, avgMoneyness,
+                        totalSnapshots
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, lifespan_record)
+                
+                # Step 5b: Delete snapshots after archiving
+                c.execute("DELETE FROM option_snapshots WHERE osiKey = ?", (osiKey,))
+
 
             conn.commit()
             conn.close()
-            self.logger.logMessage("Processed all completed options")
+            self.logger.logMessage("Processed all completed options successfully")
+
         except Exception as e:
             self.logger.logMessage("Error processing completed options")
-            self.logger.logMessage(e)
-
+            self.logger.logMessage(str(e))
 
 # -------------------------------
 # Reporting
