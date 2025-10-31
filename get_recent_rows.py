@@ -4,6 +4,8 @@ from pathlib import Path
 DB_PATH = Path("database/options.db")
 
 def get_last_30_rows(db_path: Path):
+    if db_path is None:
+        db_path=DB_PATH
     if not db_path.exists():
         print(f"Database not found at {db_path}")
         return
