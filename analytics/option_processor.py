@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional
 from logger.logger_singleton import getLogger
 
+
+
 class OptionAnalyticsProcessor:
     def __init__(self, db_path: str, check_interval: int = 60):
         self.db_path = Path(db_path)
@@ -147,28 +149,33 @@ class OptionAnalyticsProcessor:
 # Reporting
 # -------------------------------
 def get_summary(db_path):
-    """Return summary stats for both tables."""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
+    logger = getLogger()
+    try:
+        """Return summary stats for both tables."""
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
 
-    c.execute("SELECT COUNT(*) FROM option_snapshots")
-    total_snapshots = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM option_snapshots")
+        total_snapshots = c.fetchone()[0]
 
-    c.execute("SELECT COUNT(DISTINCT osiKey) FROM option_snapshots")
-    unique_options = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT osiKey) FROM option_snapshots")
+        unique_options = c.fetchone()[0]
 
-    c.execute("SELECT COUNT(DISTINCT symbol) FROM option_snapshots")
-    unique_symbols = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT symbol) FROM option_snapshots")
+        unique_symbols = c.fetchone()[0]
 
-    c.execute("SELECT COUNT(*) FROM option_lifespans")
-    completed_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM option_lifespans")
+        completed_count = c.fetchone()[0]
+        
+        c.execute("SELECT COUNT(DISTINCT symbol) FROM option_lifespans")
+        distinct_life_opts = c.fetchone()[0]
 
-    conn.close()
+        conn.close()
 
-    return {
-        "total_snapshots": total_snapshots,
-        "unique_options": unique_options,
-        "unique_symbols": unique_symbols,
-        "completed_lifespans": completed_count,
-        "last_check": datetime.utcnow().isoformat()
-    }
+        print(f"total snapshots: {total_snapshots}")
+        print(f"unique snapshot options: {unique_options}")
+        print(f"unique snapshot symbols: {unique_symbols}")
+        print(f"completed opt lifespans: {completed_count}")
+        print(f"unique option symbols: {distinct_life_opts}")
+    except Exception as e:
+        logger.logMessage("Error getting option summary data")
