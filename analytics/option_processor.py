@@ -132,7 +132,6 @@ class OptionAnalyticsProcessor:
 
                 # Step 3: Skip / delete options shorter than minimum lifespan
                 if lifespan_days < min_lifespan_days:
-                    self.logger.logMessage(f"Skipping short-lived option {osiKey} ({lifespan_days} days)")
                     c.execute("DELETE FROM option_snapshots WHERE osiKey = ?", (osiKey,))
                     continue
 
