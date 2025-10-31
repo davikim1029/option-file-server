@@ -87,10 +87,14 @@ async def lifespan(app: FastAPI):
     logger.logMessage("Log monitor started")
     
     # Start analytics processor
-    db_path = Path("./database/options.db")
-    analytics_processor = OptionAnalyticsProcessor(db_path=db_path, check_interval=60)
-    analytics_processor.start()
-    logger.logMessage("Analytics processor started")
+    try:
+        db_path = Path("./database/options.db")
+        analytics_processor = OptionAnalyticsProcessor(db_path=db_path, check_interval=60)
+        analytics_processor.start()
+        logger.logMessage("Analytics processor started")
+    except Exception as e:
+        print("Error creating analtics processor")
+        print(e)
 
     yield  # FastAPI app runs here
 
