@@ -25,7 +25,7 @@ class OptionDataProcessor:
     def _init_db(self):
         """Create options table if it doesn't exist."""
         try:
-            self.logger.logMessage("[Processor] Attempting to create database")
+            self.logger.logMessage("[Processor] Attempting to create option database if does not exist")
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             c.execute("""
@@ -59,9 +59,9 @@ class OptionDataProcessor:
             """)
             conn.commit()
             conn.close()
-            self.logger.logMessage("[Processor] Database created")
+            self.logger.logMessage("[Processor] Option Database created or exists")
         except Exception as e:
-            self.logger.logMessage("[Processor] Failed to create database")
+            self.logger.logMessage("[Processor] Failed to create option database")
             self.logger.logMessage(e)
 
     def ingest_file(self, file_path: Union[str, Path]):

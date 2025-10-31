@@ -18,27 +18,35 @@ class OptionAnalyticsProcessor:
 
     def _init_lifespan_table(self):
         """Create the derived analytics table if it doesn’t exist."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS option_lifespans (
-                osiKey TEXT PRIMARY KEY,
-                symbol TEXT,
-                optionType INTEGER,
-                strikePrice REAL,
-                startDate TEXT,
-                endDate TEXT,
-                startPrice REAL,
-                endPrice REAL,
-                totalChange REAL,
-                avgIV REAL,
-                maxIV REAL,
-                minIV REAL,
-                totalSnapshots INTEGER
-            )
-        """)
-        conn.commit()
-        conn.close()
+        self.logger.logMessage("Creating Lifespan database if doesn't exist")
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS option_lifespans (
+                    osiKey TEXT PRIMARY KEY,
+                    symbol TEXT,
+                    optionType INTEGER,
+                    strikePrice REAL,
+                    startDate TEXT,
+                    endDate TEXT,
+                    startPrice REAL,
+                    endPrice REAL,
+                    totalChange REAL,
+                    avgIV REAL,
+                    maxIV REAL,
+                    minIV REAL,
+                    totalSnapshots INTEGER
+                )
+            """)
+            conn.commit()
+            conn.close()
+            self.logger.logMessage("Lifespan Database created/exists")
+        except Exception as e:
+            self.logger.logMessage("Error creating lifespan database")
+            self.logger.logMessage(e)
+            
+
 
     # -------------------------------
     # Core Background Loop
@@ -73,62 +81,69 @@ class OptionAnalyticsProcessor:
     # Core Analytics Logic
     # -------------------------------
     def process_completed_options(self):
-        """Find options where daysToExpiration <= 0 and archive their lifespan data."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        try:
+            self.logger.logMessage("Processing completed options")
+            """Find options where daysToExpiration <= 0 and archive their lifespan data."""
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
-        # Get all osiKeys that have expired in all their snapshots
-        c.execute("""
-            SELECT osiKey, symbol, optionType, strikePrice
-            FROM option_snapshots
-            GROUP BY osiKey
-            HAVING MAX(daysToExpiration) <= 0
-        """)
-        completed = c.fetchall()
-
-        for osiKey, symbol, optionType, strike in completed:
-            # Skip if already archived
-            c.execute("SELECT 1 FROM option_lifespans WHERE osiKey = ?", (osiKey,))
-            if c.fetchone():
-                continue
-
-            # Fetch full history for this option
+            # Get all osiKeys that have expired in all their snapshots
             c.execute("""
-                SELECT timestamp, lastPrice, iv
+                SELECT osiKey, symbol, optionType, strikePrice
                 FROM option_snapshots
-                WHERE osiKey = ?
-                ORDER BY timestamp ASC
-            """, (osiKey,))
-            rows = c.fetchall()
-            if not rows:
-                continue
+                GROUP BY osiKey
+                HAVING MAX(daysToExpiration) <= 0
+            """)
+            completed = c.fetchall()
 
-            startDate = rows[0][0]
-            endDate = rows[-1][0]
-            startPrice = rows[0][1]
-            endPrice = rows[-1][1]
-            totalChange = endPrice - startPrice
+            for osiKey, symbol, optionType, strike in completed:
+                # Skip if already archived
+                c.execute("SELECT 1 FROM option_lifespans WHERE osiKey = ?", (osiKey,))
+                if c.fetchone():
+                    continue
 
-            iv_values = [r[2] for r in rows if r[2] is not None]
-            avgIV = sum(iv_values) / len(iv_values) if iv_values else None
-            maxIV = max(iv_values) if iv_values else None
-            minIV = min(iv_values) if iv_values else None
+                # Fetch full history for this option
+                c.execute("""
+                    SELECT timestamp, lastPrice, iv
+                    FROM option_snapshots
+                    WHERE osiKey = ?
+                    ORDER BY timestamp ASC
+                """, (osiKey,))
+                rows = c.fetchall()
+                if not rows:
+                    continue
 
-            c.execute("""
-                INSERT OR REPLACE INTO option_lifespans (
-                    osiKey, symbol, optionType, strikePrice,
-                    startDate, endDate, startPrice, endPrice,
-                    totalChange, avgIV, maxIV, minIV, totalSnapshots
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                osiKey, symbol, optionType, strike, startDate, endDate,
-                startPrice, endPrice, totalChange, avgIV, maxIV, minIV, len(rows)
-            ))
+                startDate = rows[0][0]
+                endDate = rows[-1][0]
+                startPrice = rows[0][1]
+                endPrice = rows[-1][1]
+                totalChange = endPrice - startPrice
 
-            self.logger.info(f"Archived lifespan for {osiKey}")
+                iv_values = [r[2] for r in rows if r[2] is not None]
+                avgIV = sum(iv_values) / len(iv_values) if iv_values else None
+                maxIV = max(iv_values) if iv_values else None
+                minIV = min(iv_values) if iv_values else None
 
-        conn.commit()
-        conn.close()
+                c.execute("""
+                    INSERT OR REPLACE INTO option_lifespans (
+                        osiKey, symbol, optionType, strikePrice,
+                        startDate, endDate, startPrice, endPrice,
+                        totalChange, avgIV, maxIV, minIV, totalSnapshots
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    osiKey, symbol, optionType, strike, startDate, endDate,
+                    startPrice, endPrice, totalChange, avgIV, maxIV, minIV, len(rows)
+                ))
+
+                self.logger.info(f"Archived lifespan for {osiKey}")
+
+            conn.commit()
+            conn.close()
+            self.logger.logMessage("Processed all completed options")
+        except Exception as e:
+            self.logger.logMessage("Error processing completed options")
+            self.logger.logMessage(e)
+
 
 # -------------------------------
 # Reporting
