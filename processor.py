@@ -50,46 +50,55 @@ class OptionDataProcessor:
 
     def ingest_file(self, file_path: Union[str, Path]):
         """Read a JSON file of OptionFeature objects and store in DB."""
+        print(f"Attempting to ingest file {file_path.name}")
         file_path = Path(file_path)
         if not file_path.exists():
+            print(f"File path {file_path.name} does not exist")
             return
 
-        with file_path.open("r") as f:
-            data = json.load(f)
+        try:
+            with file_path.open("r") as f:
+                data = json.load(f)
+        except:
+            print(f"Could not load file {file_path.name}")
 
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
-        for entry in data:
-            # Create OptionFeature instance for validation / typing
-            option = OptionFeature(**entry)
+            for entry in data:
+                # Create OptionFeature instance for validation / typing
+                option = OptionFeature(**entry)
 
-            # Ensure timestamp exists, fallback to now
-            ts = getattr(option, "timestamp", None)
-            if ts is None:
-                ts = datetime.utcnow().isoformat()
-            elif isinstance(ts, datetime):
-                ts = ts.isoformat()
+                # Ensure timestamp exists, fallback to now
+                ts = getattr(option, "timestamp", None)
+                if ts is None:
+                    ts = datetime.utcnow().isoformat()
+                elif isinstance(ts, datetime):
+                    ts = ts.isoformat()
 
-            c.execute("""
-                INSERT OR REPLACE INTO option_snapshots (
-                    osiKey, timestamp, symbol, optionType, strikePrice,
-                    lastPrice, bid, ask, bidSize, askSize, volume, openInterest,
-                    nearPrice, inTheMoney, delta, gamma, theta, vega, rho, iv,
-                    daysToExpiration, spread, midPrice, moneyness
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-            """, (
-                option.osiKey, ts, option.symbol, option.optionType, option.strikePrice,
-                option.lastPrice, option.bid, option.ask, option.bidSize, option.askSize,
-                option.volume, option.openInterest, option.nearPrice, option.inTheMoney,
-                option.delta, option.gamma, option.theta, option.vega, option.rho, option.iv,
-                option.daysToExpiration, option.spread, option.midPrice, option.moneyness
-            ))
+                c.execute("""
+                    INSERT OR REPLACE INTO option_snapshots (
+                        osiKey, timestamp, symbol, optionType, strikePrice,
+                        lastPrice, bid, ask, bidSize, askSize, volume, openInterest,
+                        nearPrice, inTheMoney, delta, gamma, theta, vega, rho, iv,
+                        daysToExpiration, spread, midPrice, moneyness
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                """, (
+                    option.osiKey, ts, option.symbol, option.optionType, option.strikePrice,
+                    option.lastPrice, option.bid, option.ask, option.bidSize, option.askSize,
+                    option.volume, option.openInterest, option.nearPrice, option.inTheMoney,
+                    option.delta, option.gamma, option.theta, option.vega, option.rho, option.iv,
+                    option.daysToExpiration, option.spread, option.midPrice, option.moneyness
+                ))
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("Error loading file into DB")
+            print(e)
 
     def get_lifetime_for_osi(self, osi_key: str):
         """Return all snapshots for a given OSI key, ordered by timestamp."""
