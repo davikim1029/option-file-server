@@ -5,6 +5,14 @@ from datetime import datetime
 from shared_options import OptionFeature
 from typing import Union
 
+LOG_FILE = Path("option_server.log")
+
+import sys
+from pathlib import Path
+
+sys.stdout = open(LOG_FILE, "a", buffering=1)  # line-buffered
+sys.stderr = sys.stdout
+
 class OptionDataProcessor:
     def __init__(self, db_path: Union[str, Path], incoming_folder: Union[str, Path]):
         self.db_path = Path(db_path)
@@ -50,17 +58,17 @@ class OptionDataProcessor:
 
     def ingest_file(self, file_path: Union[str, Path]):
         """Read a JSON file of OptionFeature objects and store in DB."""
-        print(f"Attempting to ingest file {file_path.name}")
+        print(f"[Processor] Attempting to ingest file {file_path.name}")
         file_path = Path(file_path)
         if not file_path.exists():
-            print(f"File path {file_path.name} does not exist")
+            print(f"[Processor] File path {file_path.name} does not exist")
             return
 
         try:
             with file_path.open("r") as f:
                 data = json.load(f)
         except:
-            print(f"Could not load file {file_path.name}")
+            print(f"[Processor] Could not load file {file_path.name}")
 
         try:
             conn = sqlite3.connect(self.db_path)
@@ -97,7 +105,7 @@ class OptionDataProcessor:
             conn.commit()
             conn.close()
         except Exception as e:
-            print("Error loading file into DB")
+            print(f"[Processor] Error loading file {file_path.name} into DB")
             print(e)
 
     def get_lifetime_for_osi(self, osi_key: str):

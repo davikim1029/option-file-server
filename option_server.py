@@ -22,6 +22,13 @@ CHECK_INTERVAL = 5  # seconds
 LOG_FILE = Path("option_server.log")
 MAX_LOG_LINES = 10000  # Keep last 10k lines
 
+import sys
+from pathlib import Path
+
+sys.stdout = open(LOG_FILE, "a", buffering=1)  # line-buffered
+sys.stderr = sys.stdout
+
+
 # -----------------------------
 # FastAPI app
 # -----------------------------
@@ -39,13 +46,13 @@ def file_watcher():
 
     while True:
         for file in SAVE_DIR.glob("*.json"):
-            print(f"Processing {file}")
+            print(f"[File Watcher] Processing {file}")
             try:
                 processor.ingest_file(file)
                 # Delete after ingestion
                 file.unlink()
             except Exception as e:
-                print(f"Error processing {file}: {e}")
+                print(f"[File Watcher] Error processing {file}: {e}")
         time.sleep(CHECK_INTERVAL)
 
 # -----------------------------
