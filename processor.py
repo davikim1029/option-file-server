@@ -22,39 +22,44 @@ class OptionDataProcessor:
 
     def _init_db(self):
         """Create options table if it doesn't exist."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS option_snapshots (
-                osiKey TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                symbol TEXT,
-                optionType INTEGER,
-                strikePrice REAL,
-                lastPrice REAL,
-                bid REAL,
-                ask REAL,
-                bidSize REAL,
-                askSize REAL,
-                volume REAL,
-                openInterest REAL,
-                nearPrice REAL,
-                inTheMoney INTEGER,
-                delta REAL,
-                gamma REAL,
-                theta REAL,
-                vega REAL,
-                rho REAL,
-                iv REAL,
-                daysToExpiration REAL,
-                spread REAL,
-                midPrice REAL,
-                moneyness REAL,
-                PRIMARY KEY (osiKey, timestamp)
-            )
-        """)
-        conn.commit()
-        conn.close()
+        try:
+            print("Attempting to create database")
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS option_snapshots (
+                    osiKey TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT,
+                    optionType INTEGER,
+                    strikePrice REAL,
+                    lastPrice REAL,
+                    bid REAL,
+                    ask REAL,
+                    bidSize REAL,
+                    askSize REAL,
+                    volume REAL,
+                    openInterest REAL,
+                    nearPrice REAL,
+                    inTheMoney INTEGER,
+                    delta REAL,
+                    gamma REAL,
+                    theta REAL,
+                    vega REAL,
+                    rho REAL,
+                    iv REAL,
+                    daysToExpiration REAL,
+                    spread REAL,
+                    midPrice REAL,
+                    moneyness REAL,
+                    PRIMARY KEY (osiKey, timestamp)
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("Failed to create database")
+            print(e)
 
     def ingest_file(self, file_path: Union[str, Path]):
         """Read a JSON file of OptionFeature objects and store in DB."""
@@ -104,6 +109,7 @@ class OptionDataProcessor:
 
             conn.commit()
             conn.close()
+            print(f"[Processor] File added to database")
         except Exception as e:
             print(f"[Processor] Error loading file {file_path.name} into DB")
             print(e)
