@@ -62,7 +62,7 @@ class OptionAnalyticsProcessor:
 
     def stop(self):
         if not self.running:
-            self.logger.info("[Analytics] Processor is not running.")
+            self.logger.logMessage("[Analytics] Processor is not running.")
             return
         self.running = False
         if self.thread:
@@ -135,7 +135,7 @@ class OptionAnalyticsProcessor:
                     startPrice, endPrice, totalChange, avgIV, maxIV, minIV, len(rows)
                 ))
 
-                self.logger.info(f"Archived lifespan for {osiKey}")
+                self.logger.logMessage(f"Archived lifespan for {osiKey}")
 
             conn.commit()
             conn.close()

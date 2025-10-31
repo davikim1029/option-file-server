@@ -38,13 +38,7 @@ RESTART_DELAY = 2  # seconds before auto-restart if crashed
 # -----------------------------
 # Setup Rotating Logger
 # -----------------------------
-logger = logging.getLogger("OptionServer")
-logger.setLevel(logging.INFO)
-LOG_FILE.parent.mkdir(exist_ok=True)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+logger = logging.getLogger()
 
 # -----------------------------
 # Helper Functions
@@ -106,11 +100,11 @@ def monitor_loop():
     """Continuously monitor the server and restart if it crashes."""
     while True:
         if is_server_running():
-            logger.info("Server already running. Monitor sleeping...")
+            logger.logMessage("Server already running. Monitor sleeping...")
             time.sleep(RESTART_DELAY)
             continue
 
-        logger.info(f"Starting server at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.logMessage(f"Starting server at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         if PID_FILE.exists():
             PID_FILE.unlink(missing_ok=True)
 
