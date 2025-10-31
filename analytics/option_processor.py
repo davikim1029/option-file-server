@@ -12,7 +12,7 @@ class OptionAnalyticsProcessor:
         self.check_interval = check_interval
         self.running = False
         self.thread: Optional[threading.Thread] = None
-        self.logger = getLogger("OptionAnalyticsProcessor")
+        self.logger = getLogger()
 
         self._init_lifespan_table()
 
@@ -53,28 +53,28 @@ class OptionAnalyticsProcessor:
     # -------------------------------
     def start(self):
         if self.running:
-            self.logger.info("Analytics processor is already running.")
+            self.logger.logMessage("[Analytics] Processor is already running.")
             return
         self.running = True
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
-        self.logger.info("Analytics processor started.")
+        self.logger.logMessage("[Analytics] Processor started.")
 
     def stop(self):
         if not self.running:
-            self.logger.info("Analytics processor is not running.")
+            self.logger.info("[Analytics] Processor is not running.")
             return
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)
-        self.logger.info("Analytics processor stopped.")
+        self.logger.logMessage("[Analytics] Processor stopped.")
 
     def _run_loop(self):
         while self.running:
             try:
                 self.process_completed_options()
             except Exception as e:
-                self.logger.error(f"Error in analytics loop: {e}")
+                self.logger.logMessage(f"[Analytics] Error in analytics loop: {e}")
             time.sleep(self.check_interval)
 
     # -------------------------------
