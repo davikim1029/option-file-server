@@ -8,6 +8,8 @@ from typing import List
 from pydantic import BaseModel
 from shared_options import OptionFeature
 from processor import OptionDataProcessor
+from analytics.option_processor import OptionAnalyticsProcessor
+
 
 # -----------------------------
 # Configuration
@@ -22,12 +24,8 @@ CHECK_INTERVAL = 5  # seconds
 LOG_FILE = Path("option_server.log")
 MAX_LOG_LINES = 10000  # Keep last 10k lines
 
-import sys
-from pathlib import Path
-
-sys.stdout = open(LOG_FILE, "a", buffering=1)  # line-buffered
-sys.stderr = sys.stdout
-
+from logger.logger_singleton import getLogger
+logger = getLogger()
 
 # -----------------------------
 # FastAPI app
@@ -46,13 +44,13 @@ def file_watcher():
 
     while True:
         for file in SAVE_DIR.glob("*.json"):
-            print(f"[File Watcher] Processing {file}")
+            logger.logMessage(f"[File Watcher] Processing {file}")
             try:
                 processor.ingest_file(file)
                 # Delete after ingestion
                 file.unlink()
             except Exception as e:
-                print(f"[File Watcher] Error processing {file}: {e}")
+                logger.logMessage(f"[File Watcher] Error processing {file}: {e}")
         time.sleep(CHECK_INTERVAL)
 
 # -----------------------------
@@ -81,17 +79,27 @@ async def lifespan(app: FastAPI):
     # Start file watcher thread
     watcher_thread = threading.Thread(target=file_watcher, daemon=True)
     watcher_thread.start()
-    print("File watcher started")
+    logger.logMessage("File watcher started")
 
     # Start log monitor thread
     log_thread = threading.Thread(target=log_monitor, daemon=True)
     log_thread.start()
-    print("Log monitor started")
+    logger.logMessage("Log monitor started")
+    
+    # Start analytics processor
+    db_path = Path("./database/options.db")
+    analytics_processor = OptionAnalyticsProcessor(db_path=db_path, check_interval=60)
+    analytics_processor.start()
+    logger.logMessage("Analytics processor started")
 
     yield  # FastAPI app runs here
 
-    # Optional cleanup on shutdown
-    print("Server shutting down...")
+    # Cleanup on shutdown
+    logger.logMessage("Server shutting down...")
+    if analytics_processor:
+        analytics_processor.stop()
+        logger.logMessage("Analytics processor stopped")
+    logger.logMessage("Server shutting down...")
 
 app = FastAPI(title="Option Data Ingest Server", lifespan=lifespan)
 

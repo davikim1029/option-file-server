@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from shared_options import OptionFeature
 from typing import Union
+from logger.logger_singleton import getLogger
 
 LOG_FILE = Path("option_server.log")
 
@@ -18,12 +19,13 @@ class OptionDataProcessor:
         self.db_path = Path(db_path)
         self.incoming_folder = Path(incoming_folder)
         self.db_path.parent.mkdir(exist_ok=True, parents=True)
+        self.logger = getLogger()
         self._init_db()
 
     def _init_db(self):
         """Create options table if it doesn't exist."""
         try:
-            print("[Processor] Attempting to create database")
+            self.logger.logMessage("[Processor] Attempting to create database")
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             c.execute("""
@@ -57,24 +59,24 @@ class OptionDataProcessor:
             """)
             conn.commit()
             conn.close()
-            print("[Processor] Database created")
+            self.logger.logMessage("[Processor] Database created")
         except Exception as e:
-            print("Failed to create database")
-            print(e)
+            self.logger.logMessage("[Processor] Failed to create database")
+            self.logger.logMessage(e)
 
     def ingest_file(self, file_path: Union[str, Path]):
         """Read a JSON file of OptionFeature objects and store in DB."""
-        print(f"[Processor] Attempting to ingest file {file_path.name}")
+        self.logger.logMessage(f"[Processor] Attempting to ingest file {file_path.name}")
         file_path = Path(file_path)
         if not file_path.exists():
-            print(f"[Processor] File path {file_path.name} does not exist")
+            self.logger.logMessage(f"[Processor] File path {file_path.name} does not exist")
             return
 
         try:
             with file_path.open("r") as f:
                 data = json.load(f)
         except:
-            print(f"[Processor] Could not load file {file_path.name}")
+            self.logger.logMessage(f"[Processor] Could not load file {file_path.name}")
 
         try:
             conn = sqlite3.connect(self.db_path)
@@ -110,20 +112,9 @@ class OptionDataProcessor:
 
             conn.commit()
             conn.close()
-            print(f"[Processor] File {file_path.name} added to database")
+            self.logger.logMessage(f"[Processor] File {file_path.name} added to database")
         except Exception as e:
-            print(f"[Processor] Error loading file {file_path.name} into DB")
-            print(e)
+            self.logger.logMessage(f"[Processor] Error loading file {file_path.name} into DB")
+            self.logger.logMessage(e)
 
-    def get_lifetime_for_osi(self, osi_key: str):
-        """Return all snapshots for a given OSI key, ordered by timestamp."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute("""
-            SELECT * FROM option_snapshots
-            WHERE osiKey = ?
-            ORDER BY timestamp ASC
-        """, (osi_key,))
-        rows = c.fetchall()
-        conn.close()
-        return rows
+
