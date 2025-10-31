@@ -2,3 +2,7 @@
 .vscode
 .DS_Store
 data/
+*.pyc
+database/
+*.log
+*.pid
