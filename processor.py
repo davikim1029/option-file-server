@@ -23,7 +23,7 @@ class OptionDataProcessor:
     def _init_db(self):
         """Create options table if it doesn't exist."""
         try:
-            print("Attempting to create database")
+            print("[Processor] Attempting to create database")
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             c.execute("""
@@ -57,6 +57,7 @@ class OptionDataProcessor:
             """)
             conn.commit()
             conn.close()
+            print("[Processor] Database created")
         except Exception as e:
             print("Failed to create database")
             print(e)
@@ -109,7 +110,7 @@ class OptionDataProcessor:
 
             conn.commit()
             conn.close()
-            print(f"[Processor] File added to database")
+            print(f"[Processor] File {file_path.name} added to database")
         except Exception as e:
             print(f"[Processor] Error loading file {file_path.name} into DB")
             print(e)
