@@ -9,7 +9,7 @@ class Logger:
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         log_file = os.path.join(log_dir, f"{prefix}_{today}.log")
 
-        self.logger = logging.getLogger("DailyLogger")
+        self.logger = logging.getLogger()
         self.logger.setLevel(logging.INFO)
 
         # Remove old handlers
