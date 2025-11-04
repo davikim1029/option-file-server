@@ -75,46 +75,48 @@ class OptionDataProcessor:
         try:
             with file_path.open("r") as f:
                 data = json.load(f)
-        except:
-            self.logger.logMessage(f"[Processor] Could not load file {file_path.name}")
-
-        try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-
-            for entry in data:
-                # Create OptionFeature instance for validation / typing
-                option = OptionFeature(**entry)
-
-                # Ensure timestamp exists, fallback to now
-                ts = getattr(option, "timestamp", None)
-                if ts is None:
-                    ts = datetime.utcnow().isoformat()
-                elif isinstance(ts, datetime):
-                    ts = ts.isoformat()
-
-                c.execute("""
-                    INSERT OR REPLACE INTO option_snapshots (
-                        osiKey, timestamp, symbol, optionType, strikePrice,
-                        lastPrice, bid, ask, bidSize, askSize, volume, openInterest,
-                        nearPrice, inTheMoney, delta, gamma, theta, vega, rho, iv,
-                        daysToExpiration, spread, midPrice, moneyness
-                    ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                    )
-                """, (
-                    option.osiKey, ts, option.symbol, option.optionType, option.strikePrice,
-                    option.lastPrice, option.bid, option.ask, option.bidSize, option.askSize,
-                    option.volume, option.openInterest, option.nearPrice, option.inTheMoney,
-                    option.delta, option.gamma, option.theta, option.vega, option.rho, option.iv,
-                    option.daysToExpiration, option.spread, option.midPrice, option.moneyness
-                ))
-
-            conn.commit()
-            conn.close()
-            self.logger.logMessage(f"[Processor] File {file_path.name} added to database")
         except Exception as e:
-            self.logger.logMessage(f"[Processor] Error loading file {file_path.name} into DB")
-            self.logger.logMessage(e)
+            self.logger.logMessage(f"[Processor] Could not load file {file_path.name}")
+            self.logger.logMessage(f"Exception: {e}")
+
+        if data:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+
+                for entry in data:
+                    # Create OptionFeature instance for validation / typing
+                    option = OptionFeature(**entry)
+
+                    # Ensure timestamp exists, fallback to now
+                    ts = getattr(option, "timestamp", None)
+                    if ts is None:
+                        ts = datetime.utcnow().isoformat()
+                    elif isinstance(ts, datetime):
+                        ts = ts.isoformat()
+
+                    c.execute("""
+                        INSERT OR REPLACE INTO option_snapshots (
+                            osiKey, timestamp, symbol, optionType, strikePrice,
+                            lastPrice, bid, ask, bidSize, askSize, volume, openInterest,
+                            nearPrice, inTheMoney, delta, gamma, theta, vega, rho, iv,
+                            daysToExpiration, spread, midPrice, moneyness
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                    """, (
+                        option.osiKey, ts, option.symbol, option.optionType, option.strikePrice,
+                        option.lastPrice, option.bid, option.ask, option.bidSize, option.askSize,
+                        option.volume, option.openInterest, option.nearPrice, option.inTheMoney,
+                        option.delta, option.gamma, option.theta, option.vega, option.rho, option.iv,
+                        option.daysToExpiration, option.spread, option.midPrice, option.moneyness
+                    ))
+
+                conn.commit()
+                conn.close()
+                self.logger.logMessage(f"[Processor] File {file_path.name} added to database")
+            except Exception as e:
+                self.logger.logMessage(f"[Processor] Error loading file {file_path.name} into DB")
+                self.logger.logMessage(e)
 
 
