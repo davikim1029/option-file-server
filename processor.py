@@ -5,6 +5,7 @@ from datetime import datetime
 from shared_options import OptionFeature
 from typing import Union
 from logger.logger_singleton import getLogger
+from logging import FileHandler
 
 LOG_FILE = Path("option_server.log")
 
@@ -14,12 +15,23 @@ from pathlib import Path
 sys.stdout = open(LOG_FILE, "a", buffering=1)  # line-buffered
 sys.stderr = sys.stdout
 
+# -----------------------------
+# Setup Logger
+# -----------------------------
+logger = getLogger()
+LOG_FILE = Path("option_server.log")
+for handler in logger.logger.handlers:
+    if isinstance(handler, FileHandler):
+        LOG_FILE = Path(handler.baseFilename)
+        break # Assuming you only care about the first FileHandler found
+
+
 class OptionDataProcessor:
     def __init__(self, db_path: Union[str, Path], incoming_folder: Union[str, Path]):
         self.db_path = Path(db_path)
         self.incoming_folder = Path(incoming_folder)
         self.db_path.parent.mkdir(exist_ok=True, parents=True)
-        self.logger = getLogger()
+        self.logger = logger
         self._init_db()
 
     def _init_db(self):

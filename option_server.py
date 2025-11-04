@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from shared_options import OptionFeature
 from processor import OptionDataProcessor
 from analytics.option_processor import OptionAnalyticsProcessor
+from logging import FileHandler
 
 
 # -----------------------------
@@ -25,7 +26,16 @@ LOG_FILE = Path("option_server.log")
 MAX_LOG_LINES = 10000  # Keep last 10k lines
 
 from logger.logger_singleton import getLogger
+
+# -----------------------------
+# Setup Logger
+# -----------------------------
 logger = getLogger()
+LOG_FILE = Path("option_server.log")
+for handler in logger.logger.handlers:
+    if isinstance(handler, FileHandler):
+        LOG_FILE = Path(handler.baseFilename)
+        break # Assuming you only care about the first FileHandler found
 
 # -----------------------------
 # FastAPI app

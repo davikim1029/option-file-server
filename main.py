@@ -4,7 +4,7 @@ import subprocess
 import signal
 from pathlib import Path
 import time
-import logging
+from logging import FileHandler
 from logging.handlers import RotatingFileHandler
 from collections import deque
 from get_recent_rows import get_last_30_rows  # your helper for DB rows
@@ -17,7 +17,6 @@ logger = getLogger()
 # Paths & Constants
 # -----------------------------
 PID_FILE = Path("option_server.pid")
-LOG_FILE = Path("option_server.log")
 DB_PATH = Path("database/options.db")
 
 # Max log file size 5 MB, keep 3 backups
@@ -35,10 +34,17 @@ UVICORN_CMD = [
 
 RESTART_DELAY = 2  # seconds before auto-restart if crashed
 
+
 # -----------------------------
-# Setup Rotating Logger
+# Setup Logger
 # -----------------------------
-logger = logging.getLogger()
+logger = getLogger()
+LOG_FILE = Path("option_server.log")
+for handler in logger.logger.handlers:
+    if isinstance(handler, FileHandler):
+        LOG_FILE = Path(handler.baseFilename)
+        break # Assuming you only care about the first FileHandler found
+
 
 # -----------------------------
 # Helper Functions
