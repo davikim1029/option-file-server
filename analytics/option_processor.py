@@ -7,8 +7,23 @@ from typing import Optional
 from logger.logger_singleton import getLogger
 
 
-
 class OptionAnalyticsProcessor:
+    """
+    Archives completed option snapshots into option_lifetimes preserving the
+    full snapshot schema so AI training can consume exact historic rows.
+    """
+
+    SNAPSHOT_TABLE = "option_snapshots"
+    LIFETIME_TABLE = "option_lifetimes"
+
+    # List of columns expected in the snapshot table (kept in same order)
+    SNAPSHOT_COLUMNS = [
+        "osiKey", "timestamp", "symbol", "optionType", "strikePrice", "lastPrice",
+        "bid", "ask", "bidSize", "askSize", "volume", "openInterest", "nearPrice",
+        "inTheMoney", "delta", "gamma", "theta", "vega", "rho", "iv", "daysToExpiration",
+        "spread", "midPrice", "moneyness"
+    ]
+
     def __init__(self, db_path: str, check_interval: int = 60):
         self.db_path = Path(db_path)
         self.check_interval = check_interval
@@ -16,57 +31,64 @@ class OptionAnalyticsProcessor:
         self.thread: Optional[threading.Thread] = None
         self.logger = getLogger()
 
-        self._init_lifespan_table()
+        self._init_lifetime_table()
 
-    def _init_lifespan_table(self):
-        """Create the derived analytics table if it doesn’t exist."""
-        self.logger.logMessage("Creating Lifespan database if it doesn't exist")
+    # ---------------------------------------
+    # Initialization: create lifetime table
+    # ---------------------------------------
+    def _init_lifetime_table(self):
+        """Create option_lifetimes using the same schema as option_snapshots."""
         try:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS option_lifespans (
-                    osiKey TEXT PRIMARY KEY,
+
+            # Build CREATE TABLE statement using the same columns and types from snapshots.
+            # We choose TEXT for osiKey/timestamp/symbol, INTEGER for ints, REAL for floats.
+            # Keep same names so downstream AI code can be reused without remapping.
+            c.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.LIFETIME_TABLE} (
+                    osiKey TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
                     symbol TEXT,
                     optionType INTEGER,
                     strikePrice REAL,
-                    startDate TEXT,
-                    endDate TEXT,
-                    startPrice REAL,
-                    endPrice REAL,
-                    totalChange REAL,
-                    avgIV REAL,
-                    maxIV REAL,
-                    minIV REAL,
-                    avgDelta REAL,
-                    avgGamma REAL,
-                    avgTheta REAL,
-                    avgVega REAL,
-                    avgRho REAL,
-                    avgBidAskSpread REAL,
-                    avgVolume REAL,
-                    avgOpenInterest REAL,
-                    avgMidPrice REAL,
-                    avgMoneyness REAL,
-                    totalSnapshots INTEGER
+                    lastPrice REAL,
+                    bid REAL,
+                    ask REAL,
+                    bidSize REAL,
+                    askSize REAL,
+                    volume REAL,
+                    openInterest REAL,
+                    nearPrice REAL,
+                    inTheMoney INTEGER,
+                    delta REAL,
+                    gamma REAL,
+                    theta REAL,
+                    vega REAL,
+                    rho REAL,
+                    iv REAL,
+                    daysToExpiration REAL,
+                    spread REAL,
+                    midPrice REAL,
+                    moneyness REAL,
+                    PRIMARY KEY (osiKey, timestamp)
                 )
             """)
+            # performance index for lookup by osiKey
+            c.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.LIFETIME_TABLE}_osi ON {self.LIFETIME_TABLE} (osiKey)")
             conn.commit()
             conn.close()
-            self.logger.logMessage("Lifespan Database created / exists")
+            self.logger.logMessage("[Analytics] Lifetime table initialized (same schema as snapshots).")
         except Exception as e:
-            self.logger.logMessage("Error creating lifespan database")
+            self.logger.logMessage("[Analytics] Error initializing lifetime table:")
             self.logger.logMessage(str(e))
 
-            
-
-
-    # -------------------------------
-    # Core Background Loop
-    # -------------------------------
+    # ---------------------------------------
+    # Thread control
+    # ---------------------------------------
     def start(self):
         if self.running:
-            self.logger.logMessage("[Analytics] Processor is already running.")
+            self.logger.logMessage("[Analytics] Processor already running.")
             return
         self.running = True
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -75,7 +97,7 @@ class OptionAnalyticsProcessor:
 
     def stop(self):
         if not self.running:
-            self.logger.logMessage("[Analytics] Processor is not running.")
+            self.logger.logMessage("[Analytics] Processor not running.")
             return
         self.running = False
         if self.thread:
@@ -83,42 +105,58 @@ class OptionAnalyticsProcessor:
         self.logger.logMessage("[Analytics] Processor stopped.")
 
     def _run_loop(self):
+        """Background loop: periodically archive completed lifetimes."""
         while self.running:
             try:
-                self.process_completed_options()
+                self.archive_completed_lifetimes()
             except Exception as e:
-                self.logger.logMessage(f"[Analytics] Error in analytics loop: {e}")
+                self.logger.logMessage(f"[Analytics] Error in loop: {e}")
             time.sleep(self.check_interval)
 
-        # -------------------------------
-        # Core Analytics Logic
-        # -------------------------------
-    def process_completed_options(self, min_lifespan_days: int = 5):
+    # ---------------------------------------
+    # Core archiving logic
+    # ---------------------------------------
+    def archive_completed_lifetimes(self, min_lifespan_days: int = 0):
+        """
+        Find completed options (MAX(daysToExpiration) <= 0), and for each:
+            - copy all snapshot rows into option_lifetimes (same schema)
+            - delete those snapshot rows from option_snapshots
+        Optionally skip very short-lived options by min_lifespan_days.
+        """
         try:
-            self.logger.logMessage("Processing completed options")
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
 
-            # Step 1: Find all fully expired options
-            c.execute("""
+            # 1) Find osiKeys that have completed (max(daysToExpiration) <= 0)
+            c.execute(f"""
                 SELECT osiKey
-                FROM option_snapshots
+                FROM {self.SNAPSHOT_TABLE}
                 GROUP BY osiKey
                 HAVING MAX(daysToExpiration) <= 0
             """)
             completed = [row[0] for row in c.fetchall()]
+            archived_count = 0
 
             for osiKey in completed:
-                # Skip if already archived
-                c.execute("SELECT 1 FROM option_lifespans WHERE osiKey = ?", (osiKey,))
-                if c.fetchone():
+                # If already archived, clear and replace to ensure completeness
+                c.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?", (osiKey,))
+                
+                # Verify truly expired
+                c.execute(f"""
+                    SELECT COUNT(*) FROM {self.SNAPSHOT_TABLE}
+                    WHERE osiKey = ? AND daysToExpiration > 0
+                """, (osiKey,))
+                still_active = c.fetchone()[0]
+                if still_active > 0:
+                    # skip if some data shows it's still active
                     continue
 
-                # Step 2: Fetch all snapshots
-                c.execute("""
-                    SELECT timestamp, lastPrice, iv, delta, gamma, theta, vega, rho, bid, ask,
-                        volume, openInterest, midPrice, moneyness
-                    FROM option_snapshots
+
+
+                # fetch all snapshot rows for this osiKey in chronological order
+                c.execute(f"""
+                    SELECT {', '.join(self.SNAPSHOT_COLUMNS)}
+                    FROM {self.SNAPSHOT_TABLE}
                     WHERE osiKey = ?
                     ORDER BY timestamp ASC
                 """, (osiKey,))
@@ -126,112 +164,89 @@ class OptionAnalyticsProcessor:
                 if not rows:
                     continue
 
-                start_ts = datetime.fromisoformat(rows[0][0])
-                end_ts = datetime.fromisoformat(rows[-1][0])
-                lifespan_days = (end_ts - start_ts).days
+                # validate lifespan length if desired
+                try:
+                    start_ts = datetime.fromisoformat(rows[0][1])
+                    end_ts = datetime.fromisoformat(rows[-1][1])
+                except Exception:
+                    # If timestamps are malformed, still proceed but skip min lifespan check
+                    start_ts = None
+                    end_ts = None
 
-                # Step 3: Skip / delete options shorter than minimum lifespan
-                if lifespan_days < min_lifespan_days:
-                    c.execute("DELETE FROM option_snapshots WHERE osiKey = ?", (osiKey,))
-                    continue
+                if start_ts and end_ts:
+                    lifespan_days = (end_ts - start_ts).days
+                    if min_lifespan_days and lifespan_days < min_lifespan_days:
+                        # delete snapshots that are too short-lived to save space
+                        c.execute(f"DELETE FROM {self.SNAPSHOT_TABLE} WHERE osiKey = ?", (osiKey,))
+                        conn.commit()
+                        continue
 
-                # Step 4: Aggregate statistics
-                last_prices = [r[1] for r in rows]
-                iv_values = [r[2] for r in rows if r[2] is not None]
-                deltas = [r[3] for r in rows]
-                gammas = [r[4] for r in rows]
-                thetas = [r[5] for r in rows]
-                vegas = [r[6] for r in rows]
-                rhos = [r[7] for r in rows]
-                bids = [r[8] for r in rows]
-                asks = [r[9] for r in rows]
-                volumes = [r[10] for r in rows]
-                open_interests = [r[11] for r in rows]
-                mid_prices = [r[12] for r in rows if r[12] is not None]
-                moneyness = [r[13] for r in rows if r[13] is not None]
+                # Insert all snapshot rows into lifetime table
+                # build placeholders and execute many
+                placeholders = ", ".join(["?"] * len(self.SNAPSHOT_COLUMNS))
+                insert_sql = f"""
+                    INSERT OR REPLACE INTO {self.LIFETIME_TABLE} ({', '.join(self.SNAPSHOT_COLUMNS)})
+                    VALUES ({placeholders})
+                """
+                # ensure rows are tuples that align with column order (they already are from SELECT)
+                c.executemany(insert_sql, rows)
 
-                avg_bid_ask_spread = sum([a - b for a, b in zip(asks, bids)]) / len(rows)
+                # delete from snapshot table after successful insert
+                c.execute(f"DELETE FROM {self.SNAPSHOT_TABLE} WHERE osiKey = ?", (osiKey,))
 
-                lifespan_record = (
-                    osiKey,
-                    rows[0][1],  # symbol
-                    rows[0][2],  # optionType
-                    rows[0][3],  # strikePrice
-                    start_ts.isoformat(),
-                    end_ts.isoformat(),
-                    last_prices[0],  # startPrice
-                    last_prices[-1],  # endPrice
-                    last_prices[-1] - last_prices[0],  # totalChange
-                    sum(iv_values)/len(iv_values) if iv_values else None,
-                    max(iv_values) if iv_values else None,
-                    min(iv_values) if iv_values else None,
-                    sum(deltas)/len(deltas),
-                    sum(gammas)/len(gammas),
-                    sum(thetas)/len(thetas),
-                    sum(vegas)/len(vegas),
-                    sum(rhos)/len(rhos),
-                    avg_bid_ask_spread,
-                    sum(volumes)/len(volumes),
-                    sum(open_interests)/len(open_interests),
-                    sum(mid_prices)/len(mid_prices) if mid_prices else None,
-                    sum(moneyness)/len(moneyness) if moneyness else None,
-                    len(rows)
-                )
+                conn.commit()
+                archived_count += 1
 
-                # Step 5: Insert aggregated record into lifespan table
-                c.execute("""
-                    INSERT OR REPLACE INTO option_lifespans (
-                        osiKey, symbol, optionType, strikePrice,
-                        startDate, endDate, startPrice, endPrice, totalChange,
-                        avgIV, maxIV, minIV, avgDelta, avgGamma, avgTheta, avgVega, avgRho,
-                        avgBidAskSpread, avgVolume, avgOpenInterest, avgMidPrice, avgMoneyness,
-                        totalSnapshots
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, lifespan_record)
-                
-                # Step 5b: Delete snapshots after archiving
-                c.execute("DELETE FROM option_snapshots WHERE osiKey = ?", (osiKey,))
-
-
-            conn.commit()
             conn.close()
-            self.logger.logMessage("Processed all completed options successfully")
-
+            if archived_count:
+                self.logger.logMessage(f"[Analytics] Archived lifetimes for {archived_count} options.")
         except Exception as e:
-            self.logger.logMessage("Error processing completed options")
+            self.logger.logMessage("[Analytics] Error archiving completed lifetimes:")
             self.logger.logMessage(str(e))
 
-# -------------------------------
-# Reporting
-# -------------------------------
-def get_summary(db_path):
+
+# ---------------------------------------
+# Reporting helper
+# ---------------------------------------
+def get_summary(db_path: str):
+    """
+    Print summary counts for snapshot and lifetime tables.
+    """
     logger = getLogger()
     try:
-        """Return summary stats for both tables."""
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
 
-        c.execute("SELECT COUNT(*) FROM option_snapshots")
+        # Snapshots
+        c.execute(f"SELECT COUNT(*) FROM {OptionAnalyticsProcessor.SNAPSHOT_TABLE}")
         total_snapshots = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(DISTINCT osiKey) FROM option_snapshots")
-        unique_options = c.fetchone()[0]
+        c.execute(f"SELECT COUNT(DISTINCT osiKey) FROM {OptionAnalyticsProcessor.SNAPSHOT_TABLE}")
+        unique_active_options = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(DISTINCT symbol) FROM option_snapshots")
-        unique_symbols = c.fetchone()[0]
+        c.execute(f"SELECT COUNT(DISTINCT symbol) FROM {OptionAnalyticsProcessor.SNAPSHOT_TABLE}")
+        unique_active_symbols = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM option_lifespans")
-        completed_count = c.fetchone()[0]
-        
-        c.execute("SELECT COUNT(DISTINCT symbol) FROM option_lifespans")
-        distinct_life_opts = c.fetchone()[0]
+        # Lifetimes
+        c.execute(f"SELECT COUNT(*) FROM {OptionAnalyticsProcessor.LIFETIME_TABLE}")
+        total_lifetime_rows = c.fetchone()[0]
+
+        c.execute(f"SELECT COUNT(DISTINCT osiKey) FROM {OptionAnalyticsProcessor.LIFETIME_TABLE}")
+        archived_options = c.fetchone()[0]
+
+        c.execute(f"SELECT COUNT(DISTINCT symbol) FROM {OptionAnalyticsProcessor.LIFETIME_TABLE}")
+        archived_symbols = c.fetchone()[0]
 
         conn.close()
 
-        print(f"total snapshots: {total_snapshots}")
-        print(f"unique snapshot options: {unique_options}")
-        print(f"unique snapshot symbols: {unique_symbols}")
-        print(f"completed opt lifespans: {completed_count}")
-        print(f"unique option symbols: {distinct_life_opts}")
+        print("======= DB SUMMARY =======")
+        print(f"Total snapshot rows:      {total_snapshots}")
+        print(f"Unique active options:    {unique_active_options}")
+        print(f"Symbols in snapshots:     {unique_active_symbols}")
+        print(f"Total lifetime rows:      {total_lifetime_rows}  (each snapshot preserved)")
+        print(f"Archived options (osi):   {archived_options}")
+        print(f"Symbols in archives:      {archived_symbols}")
+        print("==========================")
     except Exception as e:
-        logger.logMessage("Error getting option summary data")
+        logger.logMessage("[Analytics] Error during summary reporting:")
+        logger.logMessage(str(e))
