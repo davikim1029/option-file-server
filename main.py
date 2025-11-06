@@ -7,9 +7,9 @@ import time
 from logging import FileHandler
 from logging.handlers import RotatingFileHandler
 from collections import deque
-from get_recent_rows import get_last_30_rows  # your helper for DB rows
 from logger.logger_singleton import getLogger
 from analytics.option_processor import get_summary
+from analytics.stats import stats
 
 logger = getLogger()
 
@@ -150,7 +150,7 @@ def main():
         print("2) Stop Server")
         print("3) Check Server Status")
         print("4) Run Auto-Restart Monitor (blocks terminal)")
-        print("5) Check last 30 database rows")
+        print("5) Stats")
         print("6) Tail last 10 server log lines")
         print("7) Get info on processed complete options")
         print("8) Exit")
@@ -169,7 +169,7 @@ def main():
             except KeyboardInterrupt:
                 print("Monitor loop exited.")
         elif choice == "5":
-            get_last_30_rows()
+            stats()
         elif choice == "6":
             tail_log(LOG_FILE)
             
