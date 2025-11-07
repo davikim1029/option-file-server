@@ -116,94 +116,73 @@ class OptionAnalyticsProcessor:
     # ---------------------------------------
     # Core archiving logic
     # ---------------------------------------
-    def archive_completed_lifetimes(self, min_lifespan_days: int = 0):
-        """
-        Find completed options (MAX(daysToExpiration) <= 0), and for each:
-            - copy all snapshot rows into option_lifetimes (same schema)
-            - delete those snapshot rows from option_snapshots
-        Optionally skip very short-lived options by min_lifespan_days.
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
+def archive_completed_lifetimes(self, min_snapshots: int = 5):
+    """
+    Archive completed options (daysToExpiration <= 0) into lifetime table.
+    Only archive if the option has at least `min_snapshots` rows.
+    Delete expired options that have fewer than `min_snapshots` snapshots.
+    """
+    try:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
 
-            # 1) Find osiKeys that have completed (max(daysToExpiration) <= 0)
+        # 1) Find osiKeys that have expired (max(daysToExpiration) <= 0)
+        c.execute(f"""
+            SELECT osiKey
+            FROM {self.SNAPSHOT_TABLE}
+            GROUP BY osiKey
+            HAVING MAX(daysToExpiration) <= 0
+        """)
+        expired_options = [row[0] for row in c.fetchall()]
+        archived_count = 0
+        deleted_count = 0
+
+        for osiKey in expired_options:
+            # fetch all snapshot rows for this osiKey in chronological order
             c.execute(f"""
-                SELECT osiKey
+                SELECT {', '.join(self.SNAPSHOT_COLUMNS)}
                 FROM {self.SNAPSHOT_TABLE}
-                GROUP BY osiKey
-                HAVING MAX(daysToExpiration) <= 0
-            """)
-            completed = [row[0] for row in c.fetchall()]
-            archived_count = 0
+                WHERE osiKey = ?
+                ORDER BY timestamp ASC
+            """, (osiKey,))
+            rows = c.fetchall()
 
-            for osiKey in completed:
-                # If already archived, clear and replace to ensure completeness
-                c.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?", (osiKey,))
-                
-                # Verify truly expired
-                c.execute(f"""
-                    SELECT COUNT(*) FROM {self.SNAPSHOT_TABLE}
-                    WHERE osiKey = ? AND daysToExpiration > 0
-                """, (osiKey,))
-                still_active = c.fetchone()[0]
-                if still_active > 0:
-                    # skip if some data shows it's still active
-                    continue
+            if not rows:
+                continue
 
-
-
-                # fetch all snapshot rows for this osiKey in chronological order
-                c.execute(f"""
-                    SELECT {', '.join(self.SNAPSHOT_COLUMNS)}
-                    FROM {self.SNAPSHOT_TABLE}
-                    WHERE osiKey = ?
-                    ORDER BY timestamp ASC
-                """, (osiKey,))
-                rows = c.fetchall()
-                if not rows:
-                    continue
-
-                # validate lifespan length if desired
-                try:
-                    start_ts = datetime.fromisoformat(rows[0][1])
-                    end_ts = datetime.fromisoformat(rows[-1][1])
-                except Exception:
-                    # If timestamps are malformed, still proceed but skip min lifespan check
-                    start_ts = None
-                    end_ts = None
-
-                if start_ts and end_ts:
-                    lifespan_days = (end_ts - start_ts).days
-                    if min_lifespan_days and lifespan_days < min_lifespan_days:
-                        # delete snapshots that are too short-lived to save space
-                        c.execute(f"DELETE FROM {self.SNAPSHOT_TABLE} WHERE osiKey = ?", (osiKey,))
-                        conn.commit()
-                        continue
-
-                # Insert all snapshot rows into lifetime table
-                # build placeholders and execute many
-                placeholders = ", ".join(["?"] * len(self.SNAPSHOT_COLUMNS))
-                insert_sql = f"""
-                    INSERT OR REPLACE INTO {self.LIFETIME_TABLE} ({', '.join(self.SNAPSHOT_COLUMNS)})
-                    VALUES ({placeholders})
-                """
-                # ensure rows are tuples that align with column order (they already are from SELECT)
-                c.executemany(insert_sql, rows)
-
-                # delete from snapshot table after successful insert
+            # 2) Check snapshot count
+            if len(rows) < min_snapshots:
+                # delete these snapshots; not enough data to be useful
                 c.execute(f"DELETE FROM {self.SNAPSHOT_TABLE} WHERE osiKey = ?", (osiKey,))
+                deleted_count += 1
+                self.logger.logMessage(f"[Analytics] Deleted osiKey={osiKey}: only {len(rows)} snapshots (< {min_snapshots})")
+                continue
 
-                conn.commit()
-                archived_count += 1
+            # 3) Archive all snapshots
+            # Delete from lifetime table first to ensure idempotency
+            c.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?", (osiKey,))
+            placeholders = ", ".join(["?"] * len(self.SNAPSHOT_COLUMNS))
+            insert_sql = f"""
+                INSERT OR REPLACE INTO {self.LIFETIME_TABLE} ({', '.join(self.SNAPSHOT_COLUMNS)})
+                VALUES ({placeholders})
+            """
+            c.executemany(insert_sql, rows)
 
-            conn.close()
-            if archived_count:
-                self.logger.logMessage(f"[Analytics] Archived lifetimes for {archived_count} options.")
-        except Exception as e:
-            self.logger.logMessage("[Analytics] Error archiving completed lifetimes:")
-            self.logger.logMessage(str(e))
+            # delete from snapshot table after successful insert
+            c.execute(f"DELETE FROM {self.SNAPSHOT_TABLE} WHERE osiKey = ?", (osiKey,))
+            archived_count += 1
 
+        conn.commit()
+        conn.close()
+
+        if archived_count:
+            self.logger.logMessage(f"[Analytics] Archived lifetimes for {archived_count} options.")
+        if deleted_count:
+            self.logger.logMessage(f"[Analytics] Deleted {deleted_count} expired options with too few snapshots.")
+
+    except Exception as e:
+        self.logger.logMessage("[Analytics] Error archiving completed lifetimes:")
+        self.logger.logMessage(str(e))
 
 # ---------------------------------------
 # Reporting helper
