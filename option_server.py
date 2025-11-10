@@ -25,7 +25,7 @@ CHECK_INTERVAL = 5  # seconds
 LOG_FILE = Path("option_server.log")
 MAX_LOG_LINES = 10000  # Keep last 10k lines
 
-from logger.logger_singleton import getLogger
+from shared_options.log.logger_singleton import getLogger
 
 # -----------------------------
 # Setup Logger
