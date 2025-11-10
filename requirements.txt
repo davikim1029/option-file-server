@@ -1,6 +1,6 @@
 uvicorn
 python-multipart
--e /home/dkim/GitHub/options/options-shared/
+-e ../options-shared/
 pydantic>=2.0
 numpy>=1.25
 pandas>=2.0
