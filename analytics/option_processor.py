@@ -112,6 +112,35 @@ class OptionAnalyticsProcessor:
             except Exception as e:
                 self.logger.logMessage(f"[Analytics] Error in loop: {e}")
             time.sleep(self.check_interval)
+            
+            
+    def clean_up_lifetimes_database(self, min_snapshots:int = 5):
+        try:
+            deleted_count = 0
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+
+            # 1) Find osiKeys that have expired (max(daysToExpiration) <= 0)
+            # Delete rows where the count of osiKey < threshold
+            c.execute(f"""
+            DELETE FROM {self.LIFETIME_TABLE}
+            WHERE osiKey IN (
+                SELECT osiKey
+                FROM {self.LIFETIME_TABLE}
+                GROUP BY osiKey
+                HAVING COUNT(osiKey) < {min_snapshots}
+            )
+            """)
+            deleted_count =c.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted_count:
+                self.logger.logMessage(f"[Analytics] Deleted {deleted_count} rows from the LIFETIME table due to too few snapshot rows.")
+
+        except Exception as e:
+            self.logger.logMessage("[Analytics] Error cleaning up LIFETIMEs database:")
+            self.logger.logMessage(str(e))
 
     # ---------------------------------------
     # Core archiving logic
@@ -160,7 +189,6 @@ class OptionAnalyticsProcessor:
 
                 # 3) Archive all snapshots
                 # Delete from lifetime table first to ensure idempotency
-                c.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?", (osiKey,))
                 placeholders = ", ".join(["?"] * len(self.SNAPSHOT_COLUMNS))
                 insert_sql = f"""
                     INSERT OR REPLACE INTO {self.LIFETIME_TABLE} ({', '.join(self.SNAPSHOT_COLUMNS)})
