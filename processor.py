@@ -2,9 +2,9 @@ import sqlite3
 from pathlib import Path
 import json
 from datetime import datetime
-from shared_options import OptionFeature
+from shared_options.models.OptionFeature import OptionFeature
 from typing import Union
-from logger.logger_singleton import getLogger
+from shared_options.log.logger_singleton import getLogger
 from logging import FileHandler
 
 LOG_FILE = Path("option_server.log")

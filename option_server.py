@@ -6,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import List
 from pydantic import BaseModel
-from shared_options import OptionFeature
+from shared_options.models.OptionFeature import OptionFeature
 from processor import OptionDataProcessor
 from analytics.option_processor import OptionAnalyticsProcessor
 from logging import FileHandler

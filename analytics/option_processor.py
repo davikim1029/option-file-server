@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from logger.logger_singleton import getLogger
+from shared_options.log.logger_singleton import getLogger
 
 
 class OptionAnalyticsProcessor:

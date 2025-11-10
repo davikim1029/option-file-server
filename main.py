@@ -5,9 +5,8 @@ import signal
 from pathlib import Path
 import time
 from logging import FileHandler
-from logging.handlers import RotatingFileHandler
 from collections import deque
-from logger.logger_singleton import getLogger
+from shared_options.log.logger_singleton import getLogger
 from analytics.option_processor import get_summary
 from analytics.stats import stats
 
