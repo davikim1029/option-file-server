@@ -78,6 +78,7 @@ class OptionDataProcessor:
 
     def ingest_file(self, file_path: Union[str, Path]):
         """Read a JSON file of OptionFeature objects and store in DB."""
+        data = None
         self.logger.logMessage(f"[Processor] Attempting to ingest file {file_path.name}")
         file_path = Path(file_path)
         if not file_path.exists():
