@@ -1,45 +1,63 @@
+import threading
+import time
 import sqlite3
 from pathlib import Path
 import json
 from datetime import datetime
-from shared_options.models.OptionFeature import OptionFeature
 from typing import Union
+
+from shared_options.models.OptionFeature import OptionFeature
 from shared_options.log.logger_singleton import getLogger
 from logging import FileHandler
 
-LOG_FILE = Path("option_server.log")
 
-import sys
-from pathlib import Path
-
-sys.stdout = open(LOG_FILE, "a", buffering=1)  # line-buffered
-sys.stderr = sys.stdout
-
-# -----------------------------
-# Setup Logger
-# -----------------------------
 logger = getLogger()
+
+# Resolve actual log file from logger
 LOG_FILE = Path("option_server.log")
 for handler in logger.logger.handlers:
     if isinstance(handler, FileHandler):
         LOG_FILE = Path(handler.baseFilename)
-        break # Assuming you only care about the first FileHandler found
+        break
 
 
-class OptionDataProcessor:
-    def __init__(self, db_path: Union[str, Path], incoming_folder: Union[str, Path]):
+class OptionSnapshotProcessor(threading.Thread):
+    """
+    Background processor that watches a folder and ingests snapshot files
+    into the option_snapshots database.
+    """
+
+    def __init__(
+        self,
+        db_path: Union[str, Path],
+        incoming_folder: Union[str, Path],
+        check_interval: int = 30
+    ):
+        super().__init__(daemon=True)
+
         self.db_path = Path(db_path)
-        self.incoming_folder = Path(incoming_folder)
-        self.db_path.parent.mkdir(exist_ok=True, parents=True)
+        self.folder = Path(incoming_folder)
+        self.check_interval = check_interval
+
+        # ensure necessary paths exist
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.folder.mkdir(parents=True, exist_ok=True)
+
+        self._stop_event = threading.Event()
         self.logger = logger
+
         self._init_db()
 
+    # ----------------------------------------------------------------------
+    # Database Init
+    # ----------------------------------------------------------------------
     def _init_db(self):
-        """Create options table if it doesn't exist."""
+        """Creates the option_snapshots table if missing."""
         try:
-            self.logger.logMessage("[Processor] Attempting to create option database if does not exist")
+            self.logger.logMessage("[SnapshotProcessor] Checking/creating option_snapshots table")
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
+
             c.execute("""
                 CREATE TABLE IF NOT EXISTS option_snapshots (
                     osiKey TEXT NOT NULL,
@@ -69,67 +87,106 @@ class OptionDataProcessor:
                     PRIMARY KEY (osiKey, timestamp)
                 )
             """)
+
             conn.commit()
             conn.close()
-            self.logger.logMessage("[Processor] Option Database created or exists")
+            self.logger.logMessage("[SnapshotProcessor] option_snapshots table ready")
+
         except Exception as e:
-            self.logger.logMessage("[Processor] Failed to create option database")
+            self.logger.logMessage("[SnapshotProcessor] DB init error")
             self.logger.logMessage(e)
 
+    # ----------------------------------------------------------------------
+    # Thread Control
+    # ----------------------------------------------------------------------
+    def stop(self):
+        """Signal the background thread to stop cleanly."""
+        self._stop_event.set()
+
+    # ----------------------------------------------------------------------
+    # Thread Run Loop
+    # ----------------------------------------------------------------------
+    def run(self):
+        self.logger.logMessage("[SnapshotProcessor] Started")
+
+        while not self._stop_event.is_set():
+            try:
+                # process files
+                for file in self.folder.glob("*.json"):
+                    try:
+                        self.logger.logMessage(f"[SnapshotProcessor] Processing {file.name}")
+                        self.ingest_file(file)
+                        file.unlink(missing_ok=True)
+                    except Exception as e:
+                        self.logger.logMessage(f"[SnapshotProcessor] Error processing {file.name}")
+                        self.logger.logMessage(e)
+
+                # sleep between cycles
+                time.sleep(self.check_interval)
+
+            except Exception as e:
+                self.logger.logMessage("[SnapshotProcessor] Loop crash (recovering)")
+                self.logger.logMessage(e)
+                time.sleep(5)
+
+        self.logger.logMessage("[SnapshotProcessor] Stopped")
+
+    # ----------------------------------------------------------------------
+    # Ingestion Logic
+    # ----------------------------------------------------------------------
     def ingest_file(self, file_path: Union[str, Path]):
-        """Read a JSON file of OptionFeature objects and store in DB."""
-        data = None
-        self.logger.logMessage(f"[Processor] Attempting to ingest file {file_path.name}")
+        """Read JSON snapshot file and store in the DB."""
         file_path = Path(file_path)
+        self.logger.logMessage(f"[SnapshotProcessor] Ingesting {file_path.name}")
+
         if not file_path.exists():
-            self.logger.logMessage(f"[Processor] File path {file_path.name} does not exist")
+            self.logger.logMessage(f"[SnapshotProcessor] File not found: {file_path.name}")
             return
 
         try:
             with file_path.open("r") as f:
                 data = json.load(f)
         except Exception as e:
-            self.logger.logMessage(f"[Processor] Could not load file {file_path.name}")
-            self.logger.logMessage(f"Exception: {e}")
+            self.logger.logMessage(f"[SnapshotProcessor] JSON load error for {file_path.name}")
+            self.logger.logMessage(e)
+            return
 
-        if data:
-            try:
-                conn = sqlite3.connect(self.db_path)
-                c = conn.cursor()
+        if not data:
+            self.logger.logMessage(f"[SnapshotProcessor] Empty JSON file: {file_path.name}")
+            return
 
-                for entry in data:
-                    # Create OptionFeature instance for validation / typing
-                    option = OptionFeature(**entry)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
-                    # Ensure timestamp exists, fallback to now
-                    ts = getattr(option, "timestamp", None)
-                    if ts is None:
-                        ts = datetime.utcnow().isoformat()
-                    elif isinstance(ts, datetime):
-                        ts = ts.isoformat()
+            for entry in data:
+                option = OptionFeature(**entry)
 
-                    c.execute("""
-                        INSERT OR REPLACE INTO option_snapshots (
-                            osiKey, timestamp, symbol, optionType, strikePrice,
-                            lastPrice, bid, ask, bidSize, askSize, volume, openInterest,
-                            nearPrice, inTheMoney, delta, gamma, theta, vega, rho, iv,
-                            daysToExpiration, spread, midPrice, moneyness
-                        ) VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                        )
-                    """, (
-                        option.osiKey, ts, option.symbol, option.optionType, option.strikePrice,
-                        option.lastPrice, option.bid, option.ask, option.bidSize, option.askSize,
-                        option.volume, option.openInterest, option.nearPrice, option.inTheMoney,
-                        option.delta, option.gamma, option.theta, option.vega, option.rho, option.iv,
-                        option.daysToExpiration, option.spread, option.midPrice, option.moneyness
-                    ))
+                ts = getattr(option, "timestamp", None)
+                if ts is None:
+                    ts = datetime.utcnow().isoformat()
+                elif isinstance(ts, datetime):
+                    ts = ts.isoformat()
 
-                conn.commit()
-                conn.close()
-                self.logger.logMessage(f"[Processor] File {file_path.name} added to database")
-            except Exception as e:
-                self.logger.logMessage(f"[Processor] Error loading file {file_path.name} into DB")
-                self.logger.logMessage(e)
+                c.execute("""
+                    INSERT OR REPLACE INTO option_snapshots (
+                        osiKey, timestamp, symbol, optionType, strikePrice,
+                        lastPrice, bid, ask, bidSize, askSize, volume, openInterest,
+                        nearPrice, inTheMoney, delta, gamma, theta, vega, rho, iv,
+                        daysToExpiration, spread, midPrice, moneyness
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    option.osiKey, ts, option.symbol, option.optionType, option.strikePrice,
+                    option.lastPrice, option.bid, option.ask, option.bidSize, option.askSize,
+                    option.volume, option.openInterest, option.nearPrice, option.inTheMoney,
+                    option.delta, option.gamma, option.theta, option.vega, option.rho, option.iv,
+                    option.daysToExpiration, option.spread, option.midPrice, option.moneyness
+                ))
 
+            conn.commit()
+            conn.close()
+            self.logger.logMessage(f"[SnapshotProcessor] {file_path.name} added to DB")
 
+        except Exception as e:
+            self.logger.logMessage(f"[SnapshotProcessor] DB insert error for {file_path.name}")
+            self.logger.logMessage(e)
