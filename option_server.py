@@ -7,8 +7,8 @@ from contextlib import asynccontextmanager
 from typing import List
 from pydantic import BaseModel
 from shared_options.models.OptionFeature import OptionFeature
-from processor import OptionDataProcessor
-from analytics.option_processor import OptionAnalyticsProcessor
+from processors.snapshot_processor import OptionDataProcessor
+from processors.lifetime_processor import OptionAnalyticsProcessor
 from logging import FileHandler
 
 
