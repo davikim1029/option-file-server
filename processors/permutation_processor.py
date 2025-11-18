@@ -9,14 +9,17 @@ from shared_options.log.logger_singleton import getLogger
 
 class OptionPermutationProcessor:
     """
-    Generates buy/sell permutations for each OSI from option_snapshots (or option_lifetimes).
-    Stores buy_*, sell_*, delta_* for all snapshot columns.
+    Generates buy/sell permutations for each OSI from option_lifetimes.
+    Stores buy_*, sell_*, delta_* for all snapshot columns (excluding reserved cols).
     Includes status reporting and DB maintenance (ANALYZE + periodic VACUUM).
     """
 
-    LIFETIME_TABLE = "option_lifetimes"   # or point to option_snapshots if you prefer
-    SNAPSHOT_TABLE = "option_snapshots"
+    LIFETIME_TABLE = "option_lifetimes"   # source table for snapshots (complete lifetimes)
+    SNAPSHOT_TABLE = "option_snapshots"   # kept for backward-compat, but we read from LIFETIME_TABLE
     PERM_TABLE = "option_permutations"
+
+    # columns we must NOT duplicate as buy_/sell_ prefixed columns
+    _RESERVED_COLUMNS = {"osiKey", "timestamp", "buy_timestamp", "sell_timestamp", "processed"}
 
     def __init__(self, db_path: str, check_interval: int = 60, batch_commit_size: int = 50,
                  analyze_after_commits: int = 1, vacuum_interval_hours: int = 24):
@@ -38,7 +41,7 @@ class OptionPermutationProcessor:
         self._last_vacuum: Optional[datetime] = None
         self._commit_count = 0
 
-        # load schema
+        # load schema from lifetimes
         self.snapshot_columns = self._load_snapshot_columns()
         self.numeric_columns = self._filter_numeric_columns()
 
@@ -60,23 +63,37 @@ class OptionPermutationProcessor:
         return conn
 
     def _load_snapshot_columns(self):
-        # Read actual snapshot table columns so this auto-adapts
+        """
+        Read actual column list from the lifetimes table so this auto-adapts.
+        Falls back to sensible defaults if table not present yet.
+        """
         conn = sqlite3.connect(str(self.db_path))
         cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({self.SNAPSHOT_TABLE});")
-        cols = [r[1] for r in cur.fetchall()]
+
+        # prefer LIFETIME_TABLE (complete data) — fallback to SNAPSHOT_TABLE if not present
+        for tbl in (self.LIFETIME_TABLE, self.SNAPSHOT_TABLE):
+            try:
+                cur.execute(f"PRAGMA table_info({tbl});")
+                rows = cur.fetchall()
+                if rows:
+                    cols = [r[1] for r in rows]
+                    conn.close()
+                    return cols
+            except sqlite3.OperationalError:
+                # table doesn't exist, try next
+                continue
+
         conn.close()
-        if not cols:
-            # sensible default if table not created yet
-            return [
-                "osiKey", "timestamp", "symbol", "optionType", "strikePrice", "lastPrice",
-                "bid", "ask", "bidSize", "askSize", "volume", "openInterest", "nearPrice",
-                "inTheMoney", "delta", "gamma", "theta", "vega", "rho", "iv",
-                "daysToExpiration", "spread", "midPrice", "moneyness"
-            ]
-        return cols
+        # sensible default
+        return [
+            "osiKey", "timestamp", "symbol", "optionType", "strikePrice", "lastPrice",
+            "bid", "ask", "bidSize", "askSize", "volume", "openInterest", "nearPrice",
+            "inTheMoney", "delta", "gamma", "theta", "vega", "rho", "iv",
+            "daysToExpiration", "spread", "midPrice", "moneyness", "processed"
+        ]
 
     def _filter_numeric_columns(self):
+        """All numeric columns that should have delta_ computed."""
         numeric = {
             "lastPrice", "bid", "ask", "bidSize", "askSize", "volume", "openInterest",
             "nearPrice", "inTheMoney", "delta", "gamma", "theta", "vega", "rho",
@@ -92,14 +109,20 @@ class OptionPermutationProcessor:
         c = conn.cursor()
 
         column_defs = []
-        # buy_* and sell_* columns for every snapshot column
-        for col in self.snapshot_columns:
-            # use REAL for numbers, TEXT OK for strings; using REAL for simplicity and compatibility
+
+        # Only include snapshot columns that are not reserved (avoid creating buy_timestamp / sell_timestamp duplicates)
+        dynamic_cols = [col for col in self.snapshot_columns if col not in self._RESERVED_COLUMNS]
+
+        # buy_* and sell_* columns for every allowed snapshot column
+        for col in dynamic_cols:
+            # use REAL for numbers, TEXT could be used for strings; using REAL for compatibility
             column_defs.append(f"buy_{col} REAL")
-        for col in self.snapshot_columns:
+        for col in dynamic_cols:
             column_defs.append(f"sell_{col} REAL")
-        # delta for numeric columns only
-        for col in self.numeric_columns:
+
+        # delta for numeric columns only (ensure they are allowed)
+        numeric_for_delta = [col for col in self.numeric_columns if col not in self._RESERVED_COLUMNS]
+        for col in numeric_for_delta:
             column_defs.append(f"delta_{col} REAL")
 
         # add computed metrics
@@ -107,6 +130,7 @@ class OptionPermutationProcessor:
         column_defs.append("profit REAL")
         column_defs.append("return_pct REAL")
 
+        # Build DDL — explicitly include core static columns (avoid duplication)
         ddl = f"""
             CREATE TABLE IF NOT EXISTS {self.PERM_TABLE} (
                 osiKey TEXT NOT NULL,
@@ -172,7 +196,7 @@ class OptionPermutationProcessor:
 
     def _fetch_snapshots_for_osi(self, conn, osi):
         cur = conn.cursor()
-        cur.execute(f"SELECT * FROM {self.SNAPSHOT_TABLE} WHERE osiKey = ? ORDER BY timestamp ASC;", (osi,))
+        cur.execute(f"SELECT * FROM {self.LIFETIME_TABLE} WHERE osiKey = ? ORDER BY timestamp ASC;", (osi,))
         return cur.fetchall()
 
     def _process_all_osis(self):
@@ -197,7 +221,7 @@ class OptionPermutationProcessor:
     def _process_single_osi(self, conn, osi):
         cur = conn.cursor()
         cur.row_factory = sqlite3.Row
-        cur.execute(f"SELECT * FROM {self.SNAPSHOT_TABLE} WHERE osiKey = ? ORDER BY timestamp ASC;", (osi,))
+        cur.execute(f"SELECT * FROM {self.LIFETIME_TABLE} WHERE osiKey = ? ORDER BY timestamp ASC;", (osi,))
         snaps = cur.fetchall()
 
         if len(snaps) < 2:
@@ -250,14 +274,16 @@ class OptionPermutationProcessor:
             "return_pct": return_pct
         }
 
-        # buy_* and sell_* for all snapshot columns
-        for col in self.snapshot_columns:
+        # Only add buy_/sell_ for dynamic (non-reserved) snapshot columns
+        dynamic_cols = [col for col in self.snapshot_columns if col not in self._RESERVED_COLUMNS]
+        for col in dynamic_cols:
             row[f"buy_{col}"] = buy_row.get(col)
-        for col in self.snapshot_columns:
+        for col in dynamic_cols:
             row[f"sell_{col}"] = sell_row.get(col)
 
-        # delta_* only for numeric columns
-        for col in self.numeric_columns:
+        # delta_* only for numeric columns (and ensure not reserved)
+        numeric_for_delta = [col for col in self.numeric_columns if col not in self._RESERVED_COLUMNS]
+        for col in numeric_for_delta:
             b = buy_row.get(col) or 0.0
             s = sell_row.get(col) or 0.0
             try:
