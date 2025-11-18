@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import threading, time, shutil
 from logging import FileHandler
 from shared_options.log.logger_singleton import getLogger
-
+import traceback
 from processors.snapshot_processor import OptionSnapshotProcessor
 from processors.lifetime_processor import OptionLifetimeProcessor
 from processors.permutation_processor import OptionPermutationProcessor
@@ -73,6 +73,8 @@ async def lifespan(app: FastAPI):
 
     try:
         yield
+    except Exception as e:
+        logger.logMessage(f"Lifespan crash: {e}\n{traceback.format_exc()}")
     finally:
         logger.logMessage("Server shutdown started...")
         for proc in (snapshot_processor, lifetime_processor, permutation_processor):
