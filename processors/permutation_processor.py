@@ -1,39 +1,88 @@
 # processors/permutation_processor.py
+"""
+Responsibilities:
+- Read completed option lifetimes from `option_lifetimes`
+- Generate ALL buy/sell permutations per OSI (buy at snapshot i, sell at j>i)
+- Produce rows with:
+    - osiKey, buy_timestamp, sell_timestamp
+    - buy_<col>, sell_<col> for non-reserved columns
+    - delta_<numeric_col> for numeric columns
+    - hold_seconds, profit, return_pct
+- Insert into `option_permutations` with resilient retry logic
+- Safe for large datasets (batching by OSI)
+- Periodic ANALYZE and occasional VACUUM (skip if busy)
+- Avoid duplicate column creation by inferring existing schema and adding missing columns only
+- Robust logging with status counters
+
+"""
+
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Tuple
 from shared_options.log.logger_singleton import getLogger
+
+# -------------------------------------------------------
+# Configuration defaults (tune as needed at instantiation)
+# -------------------------------------------------------
+DEFAULT_BATCH_COMMIT_SIZE = 50
+DEFAULT_CHECK_INTERVAL = 60
+DEFAULT_ANALYZE_AFTER_COMMITS = 1
+DEFAULT_VACUUM_INTERVAL_HOURS = 24
+DEFAULT_INSERT_RETRIES = 5
+DEFAULT_INSERT_RETRY_BACKOFF = 0.1  # base seconds
+
+# Reserved snapshot columns we do NOT want duplicated as buy_/sell_ columns
+_RESERVED_COLUMNS = {"osiKey", "timestamp", "buy_timestamp", "sell_timestamp", "processed"}
+
+logger = getLogger()
+
+
+def _normalize_sql_type(t: Optional[str]) -> str:
+    """Map PRAGMA type string to one of: INTEGER, REAL, TEXT"""
+    if not t:
+        return "REAL"
+    tt = t.strip().upper()
+    if "INT" in tt:
+        return "INTEGER"
+    if "CHAR" in tt or "CLOB" in tt or "TEXT" in tt:
+        return "TEXT"
+    # numeric affinity fallback
+    if "REAL" in tt or "FLOA" in tt or "DOUB" in tt:
+        return "REAL"
+    return "REAL"
+
 
 class OptionPermutationProcessor:
     """
-    Generates buy/sell permutations for each OSI from option_lifetimes.
-    Stores buy_*, sell_*, delta_* for all snapshot columns (excluding reserved cols).
-    Includes status reporting and DB maintenance (ANALYZE + periodic VACUUM).
+    See module docstring above for behavior.
     """
 
-    LIFETIME_TABLE = "option_lifetimes"   # source table for snapshots (complete lifetimes)
-    SNAPSHOT_TABLE = "option_snapshots"   # kept for backward-compat, but we read from LIFETIME_TABLE
+    LIFETIME_TABLE = "option_lifetimes"
     PERM_TABLE = "option_permutations"
 
-    # columns we must NOT duplicate as buy_/sell_ prefixed columns
-    _RESERVED_COLUMNS = {"osiKey", "timestamp", "buy_timestamp", "sell_timestamp", "processed"}
-
-    def __init__(self, db_path: str, check_interval: int = 60, batch_commit_size: int = 50,
-                 analyze_after_commits: int = 1, vacuum_interval_hours: int = 24):
+    def __init__(
+        self,
+        db_path: str,
+        check_interval: int = DEFAULT_CHECK_INTERVAL,
+        batch_commit_size: int = DEFAULT_BATCH_COMMIT_SIZE,
+        analyze_after_commits: int = DEFAULT_ANALYZE_AFTER_COMMITS,
+        vacuum_interval_hours: int = DEFAULT_VACUUM_INTERVAL_HOURS,
+        insert_retries: int = DEFAULT_INSERT_RETRIES,
+    ):
         self.db_path = Path(db_path)
         self.check_interval = check_interval
         self.batch_commit_size = batch_commit_size
         self.analyze_after_commits = max(1, analyze_after_commits)
         self.vacuum_interval = timedelta(hours=vacuum_interval_hours)
+        self.insert_retries = max(1, int(insert_retries))
 
         self.running = False
         self.thread: Optional[threading.Thread] = None
-        self.logger = getLogger()
 
-        # status counters
+        # state counters
         self._total_rows_inserted = 0
         self._total_osis_processed = 0
         self._last_run: Optional[datetime] = None
@@ -41,19 +90,26 @@ class OptionPermutationProcessor:
         self._last_vacuum: Optional[datetime] = None
         self._commit_count = 0
 
-        # load schema from lifetimes
-        self.snapshot_columns = self._load_snapshot_columns()
-        self.numeric_columns = self._filter_numeric_columns()
+        # load schema (column name + type) from lifetime table
+        self.snapshot_schema: List[Tuple[str, str]] = self._load_snapshot_schema()
+        # snapshot column names (preserve order)
+        self.snapshot_columns: List[str] = [c for c, _ in self.snapshot_schema]
+        # numeric columns for delta calculation
+        self.numeric_columns: List[str] = [c for c, t in self.snapshot_schema if _normalize_sql_type(t) in ("REAL", "INTEGER")]
 
-        # init DB table
+        # init DB (creates permutation table if missing or adds missing columns)
         self._init_perm_table()
+
+        logger.logMessage("[Permutation] Processor initialized.")
 
     # ------------------------
     # DB helpers
     # ------------------------
-    def _get_conn(self):
-        # timeout helps with transient locks
+    def _get_conn(self) -> sqlite3.Connection:
+        """Return a connection tuned for concurrency and reasonable timeouts."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=None)
+        # Use WAL to reduce lock contention when reading + writing
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
@@ -62,198 +118,249 @@ class OptionPermutationProcessor:
             pass
         return conn
 
-    def _load_snapshot_columns(self):
+    def _load_snapshot_schema(self) -> List[Tuple[str, str]]:
         """
-        Read actual column list from the lifetimes table so this auto-adapts.
-        Falls back to sensible defaults if table not present yet.
+        Inspect the lifetimes table and return list of (column_name, column_type).
+        Falls back to sensible defaults if the table is not present.
         """
         conn = sqlite3.connect(str(self.db_path))
         cur = conn.cursor()
+        schema = []
+        try:
+            cur.execute(f"PRAGMA table_info({self.LIFETIME_TABLE});")
+            rows = cur.fetchall()
+            if rows:
+                schema = [(r[1], r[2]) for r in rows]
+        except sqlite3.OperationalError:
+            # table might not exist yet
+            schema = []
+        finally:
+            conn.close()
 
-        # prefer LIFETIME_TABLE (complete data) — fallback to SNAPSHOT_TABLE if not present
-        for tbl in (self.LIFETIME_TABLE, self.SNAPSHOT_TABLE):
-            try:
-                cur.execute(f"PRAGMA table_info({tbl});")
-                rows = cur.fetchall()
-                if rows:
-                    cols = [r[1] for r in rows]
-                    conn.close()
-                    return cols
-            except sqlite3.OperationalError:
-                # table doesn't exist, try next
-                continue
-
-        conn.close()
-        # sensible default
-        return [
-            "osiKey", "timestamp", "symbol", "optionType", "strikePrice", "lastPrice",
-            "bid", "ask", "bidSize", "askSize", "volume", "openInterest", "nearPrice",
-            "inTheMoney", "delta", "gamma", "theta", "vega", "rho", "iv",
-            "daysToExpiration", "spread", "midPrice", "moneyness", "processed"
-        ]
-
-    def _filter_numeric_columns(self):
-        """All numeric columns that should have delta_ computed."""
-        numeric = {
-            "lastPrice", "bid", "ask", "bidSize", "askSize", "volume", "openInterest",
-            "nearPrice", "inTheMoney", "delta", "gamma", "theta", "vega", "rho",
-            "iv", "daysToExpiration", "spread", "midPrice", "moneyness"
-        }
-        return [c for c in self.snapshot_columns if c in numeric]
+        if not schema:
+            # sensible default schema (keeps parity with your earlier lists)
+            schema = [
+                ("osiKey", "TEXT"), ("timestamp", "TEXT"), ("symbol", "TEXT"), ("optionType", "INTEGER"),
+                ("strikePrice", "REAL"), ("lastPrice", "REAL"), ("bid", "REAL"), ("ask", "REAL"),
+                ("bidSize", "REAL"), ("askSize", "REAL"), ("volume", "REAL"), ("openInterest", "REAL"),
+                ("nearPrice", "REAL"), ("inTheMoney", "INTEGER"), ("delta", "REAL"), ("gamma", "REAL"),
+                ("theta", "REAL"), ("vega", "REAL"), ("rho", "REAL"), ("iv", "REAL"),
+                ("daysToExpiration", "REAL"), ("spread", "REAL"), ("midPrice", "REAL"), ("moneyness", "REAL"),
+                ("processed", "INTEGER")
+            ]
+        return schema
 
     # ------------------------
-    # Table init
+    # Permutation table management
     # ------------------------
     def _init_perm_table(self):
-        conn = self._get_conn()
-        c = conn.cursor()
-
-        column_defs = []
-
-        # Only include snapshot columns that are not reserved (avoid creating buy_timestamp / sell_timestamp duplicates)
-        dynamic_cols = [col for col in self.snapshot_columns if col not in self._RESERVED_COLUMNS]
-
-        # buy_* and sell_* columns for every allowed snapshot column
-        for col in dynamic_cols:
-            # use REAL for numbers, TEXT could be used for strings; using REAL for compatibility
-            column_defs.append(f"buy_{col} REAL")
-        for col in dynamic_cols:
-            column_defs.append(f"sell_{col} REAL")
-
-        # delta for numeric columns only (ensure they are allowed)
-        numeric_for_delta = [col for col in self.numeric_columns if col not in self._RESERVED_COLUMNS]
-        for col in numeric_for_delta:
-            column_defs.append(f"delta_{col} REAL")
-
-        # add computed metrics
-        column_defs.append("hold_seconds REAL")
-        column_defs.append("profit REAL")
-        column_defs.append("return_pct REAL")
-
-        # Build DDL — explicitly include core static columns (avoid duplication)
-        ddl = f"""
-            CREATE TABLE IF NOT EXISTS {self.PERM_TABLE} (
-                osiKey TEXT NOT NULL,
-                buy_timestamp TEXT NOT NULL,
-                sell_timestamp TEXT NOT NULL,
-                {', '.join(column_defs)},
-                PRIMARY KEY (osiKey, buy_timestamp, sell_timestamp)
-            );
         """
-        c.execute(ddl)
-        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.PERM_TABLE}_osi ON {self.PERM_TABLE}(osiKey);")
+        Create permutation table if missing. If table exists, ensure missing columns are added.
+        This avoids 'duplicate column' issues and preserves historical permutations.
+        """
+        conn = self._get_conn()
+        cur = conn.cursor()
+
+        # Gather desired columns (names and types)
+        dynamic_cols = [col for col, _ in self.snapshot_schema if col not in _RESERVED_COLUMNS]
+        # buy/sell typed columns: use same affinity as source column
+        buy_sell_defs = []
+        for col, col_type in self.snapshot_schema:
+            if col in _RESERVED_COLUMNS:
+                continue
+            sql_type = _normalize_sql_type(col_type)
+            buy_sell_defs.append((f"buy_{col}", sql_type))
+            buy_sell_defs.append((f"sell_{col}", sql_type))
+
+        # delta columns for numeric columns
+        delta_defs = []
+        for col, col_type in self.snapshot_schema:
+            if col in _RESERVED_COLUMNS:
+                continue
+            if _normalize_sql_type(col_type) in ("REAL", "INTEGER"):
+                delta_defs.append((f"delta_{col}", "REAL"))
+
+        # static computed metrics
+        computed_defs = [("hold_seconds", "REAL"), ("profit", "REAL"), ("return_pct", "REAL")]
+
+        # Build a map of desired column -> type
+        desired_columns: Dict[str, str] = {"osiKey": "TEXT", "buy_timestamp": "TEXT", "sell_timestamp": "TEXT"}
+        for name, t in buy_sell_defs + delta_defs + computed_defs:
+            desired_columns[name] = t
+
+        # Check if perm table exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (self.PERM_TABLE,))
+        exists = cur.fetchone() is not None
+
+        if not exists:
+            # create table fresh
+            defs_sql = ",\n    ".join([f"{col} {typ}" for col, typ in desired_columns.items()])
+            ddl = f"""
+                CREATE TABLE {self.PERM_TABLE} (
+                    {defs_sql},
+                    PRIMARY KEY (osiKey, buy_timestamp, sell_timestamp)
+                );
+            """
+            cur.execute(ddl)
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.PERM_TABLE}_osi ON {self.PERM_TABLE}(osiKey);")
+            conn.commit()
+            conn.close()
+            logger.logMessage("[Permutation] option_permutations table created.")
+            return
+
+        # If exists: inspect existing columns and add missing ones
+        cur.execute(f"PRAGMA table_info({self.PERM_TABLE});")
+        existing = {r[1]: r[2] for r in cur.fetchall()}  # name -> type
+
+        # Add columns that are missing
+        to_add = []
+        for col, typ in desired_columns.items():
+            if col not in existing:
+                to_add.append((col, typ))
+
+        for col, typ in to_add:
+            try:
+                cur.execute(f"ALTER TABLE {self.PERM_TABLE} ADD COLUMN {col} {typ};")
+            except sqlite3.OperationalError as e:
+                # If there's a race or the column now exists, ignore
+                logger.logMessage(f"[Permutation] ALTER TABLE failed for {col}: {e}")
+        # Ensure index exists
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.PERM_TABLE}_osi ON {self.PERM_TABLE}(osiKey);")
         conn.commit()
         conn.close()
-        self.logger.logMessage("[Permutation] Permutation table initialized (dynamic columns).")
+        if to_add:
+            logger.logMessage(f"[Permutation] Added {len(to_add)} missing columns to {self.PERM_TABLE}.")
 
     # ------------------------
-    # Lifecycle
+    # Lifecycle control
     # ------------------------
     def start(self):
         if self.running:
-            self.logger.logMessage("[Permutation] Processor already running.")
+            logger.logMessage("[Permutation] Processor already running.")
             return
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
-        self.logger.logMessage("[Permutation] Processor started.")
+        logger.logMessage("[Permutation] Processor started.")
 
     def stop(self):
         self.running = False
         if self.thread:
             self.thread.join(timeout=10)
-        self.logger.logMessage("[Permutation] Processor stopped.")
+        logger.logMessage("[Permutation] Processor stopped.")
 
-    def get_status(self):
+    def get_status(self) -> Dict:
         return {
             "total_rows_inserted": int(self._total_rows_inserted),
             "total_osis_processed": int(self._total_osis_processed),
             "last_run": self._last_run.isoformat() if self._last_run else None,
             "last_error": str(self._last_error) if self._last_error else None,
-            "last_vacuum": self._last_vacuum.isoformat() if self._last_vacuum else None
+            "last_vacuum": self._last_vacuum.isoformat() if self._last_vacuum else None,
+            "commit_count": int(self._commit_count)
         }
 
     # ------------------------
-    # Loop
+    # Main loop
     # ------------------------
     def _loop(self):
         while self.running:
             try:
                 self._last_run = datetime.utcnow()
-                self._process_all_osis()
+                self._process_batch()
             except Exception as e:
                 self._last_error = str(e)
-                self.logger.logMessage(f"[Permutation] Loop error: {e}")
+                logger.logMessage(f"[Permutation] Loop error: {e}")
             time.sleep(self.check_interval)
 
     # ------------------------
-    # Core processing
+    # Processing helpers
     # ------------------------
-    def _fetch_osi_list(self, conn):
+    def _fetch_osi_batch(self, conn) -> List[str]:
         cur = conn.cursor()
         cur.execute(f"SELECT DISTINCT osiKey FROM {self.LIFETIME_TABLE} LIMIT ?;", (self.batch_commit_size,))
         return [r[0] for r in cur.fetchall()]
 
-    def _fetch_snapshots_for_osi(self, conn, osi):
-        cur = conn.cursor()
-        cur.execute(f"SELECT * FROM {self.LIFETIME_TABLE} WHERE osiKey = ? ORDER BY timestamp ASC;", (osi,))
-        return cur.fetchall()
-
-    def _process_all_osis(self):
+    def _process_batch(self):
         conn = self._get_conn()
-        conn.row_factory = sqlite3.Row
+        try:
+            conn.row_factory = sqlite3.Row
+            osi_batch = self._fetch_osi_batch(conn)
+            if not osi_batch:
+                return
 
-        osi_list = self._fetch_osi_list(conn)
-        if not osi_list:
-            conn.close()
-            return
+            for osi in osi_batch:
+                try:
+                    self._process_single_osi(conn, osi)
+                    self._total_osis_processed += 1
+                except Exception as e:
+                    self._last_error = str(e)
+                    logger.logMessage(f"[Permutation] Error processing OSI={osi}: {e}")
 
-        for osi in osi_list:
+        finally:
             try:
-                self._process_single_osi(conn, osi)
-                self._total_osis_processed += 1
-            except Exception as e:
-                self._last_error = str(e)
-                self.logger.logMessage(f"[Permutation] Error processing OSI={osi}: {e}")
+                conn.close()
+            except Exception:
+                pass
 
-        conn.close()
-
-    def _process_single_osi(self, conn, osi):
+    def _process_single_osi(self, conn: sqlite3.Connection, osi: str):
+        """
+        Fetch snapshots for a single OSI from LIFETIME_TABLE (ordered by timestamp),
+        build permutations, insert them, and delete the lifetime rows.
+        """
         cur = conn.cursor()
-        cur.row_factory = sqlite3.Row
+        # ensure ordered snapshots; convert Row -> dict for safe .get usage
         cur.execute(f"SELECT * FROM {self.LIFETIME_TABLE} WHERE osiKey = ? ORDER BY timestamp ASC;", (osi,))
-        snaps = cur.fetchall()
+        raw_snaps = cur.fetchall()
+        snaps = [dict(r) for r in raw_snaps]
 
         if len(snaps) < 2:
-            # nothing useful — delete
-            conn.execute("BEGIN;")
-            conn.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?;", (osi,))
-            conn.execute("COMMIT;")
+            # nothing useful — remove to keep DB clean
+            try:
+                conn.execute("BEGIN;")
+                conn.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?;", (osi,))
+                conn.execute("COMMIT;")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
             return
 
-        rows_to_insert = []
-        for i in range(len(snaps)):
+        # Build rows (list of dict)
+        rows_to_insert: List[Dict] = []
+        for i in range(len(snaps) - 1):
             buy = snaps[i]
             for j in range(i + 1, len(snaps)):
                 sell = snaps[j]
-                rows_to_insert.append(self._build_row_from_snapshots(osi, buy, sell))
+                rows_to_insert.append(self._build_perm_row(osi, buy, sell))
 
+        # Insert and then delete lifetime rows atomically
         if rows_to_insert:
-            self._insert_rows(conn, rows_to_insert)
+            self._insert_with_retries(conn, rows_to_insert)
 
-        # delete consumed lifetimes (atomic)
-        conn.execute("BEGIN;")
-        conn.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?;", (osi,))
-        conn.execute("COMMIT;")
+        # delete consumed lifetimes
+        try:
+            conn.execute("BEGIN;")
+            conn.execute(f"DELETE FROM {self.LIFETIME_TABLE} WHERE osiKey = ?;", (osi,))
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception:
+                pass
 
-    def _build_row_from_snapshots(self, osi, buy_row, sell_row):
-        buy_ts = buy_row["timestamp"]
-        sell_ts = sell_row["timestamp"]
-        dt_buy = datetime.fromisoformat(buy_ts)
-        dt_sell = datetime.fromisoformat(sell_ts)
-        hold_seconds = (dt_sell - dt_buy).total_seconds()
+    def _build_perm_row(self, osi: str, buy_row: Dict, sell_row: Dict) -> Dict:
+        """Build a single permutation row (dict) from two snapshot dicts."""
+        buy_ts = buy_row.get("timestamp")
+        sell_ts = sell_row.get("timestamp")
+        # parse ISO timestamps defensively
+        try:
+            dt_buy = datetime.fromisoformat(buy_ts)
+            dt_sell = datetime.fromisoformat(sell_ts)
+            hold_seconds = (dt_sell - dt_buy).total_seconds()
+        except Exception:
+            hold_seconds = 0.0
 
-        # safe numeric conversion
         def _to_float(v):
             try:
                 return float(v) if v is not None else 0.0
@@ -265,27 +372,28 @@ class OptionPermutationProcessor:
         profit = sell_price - buy_price
         return_pct = profit / buy_price if buy_price else 0.0
 
-        row = {
+        row: Dict = {
             "osiKey": osi,
             "buy_timestamp": buy_ts,
             "sell_timestamp": sell_ts,
             "hold_seconds": hold_seconds,
             "profit": profit,
-            "return_pct": return_pct
+            "return_pct": return_pct,
         }
 
-        # Only add buy_/sell_ for dynamic (non-reserved) snapshot columns
-        dynamic_cols = [col for col in self.snapshot_columns if col not in self._RESERVED_COLUMNS]
-        for col in dynamic_cols:
+        # add buy_/sell_ columns for dynamic (non-reserved) snapshot columns
+        for col, _ in self.snapshot_schema:
+            if col in _RESERVED_COLUMNS:
+                continue
             row[f"buy_{col}"] = buy_row.get(col)
-        for col in dynamic_cols:
             row[f"sell_{col}"] = sell_row.get(col)
 
-        # delta_* only for numeric columns (and ensure not reserved)
-        numeric_for_delta = [col for col in self.numeric_columns if col not in self._RESERVED_COLUMNS]
-        for col in numeric_for_delta:
-            b = buy_row.get(col) or 0.0
-            s = sell_row.get(col) or 0.0
+        # delta for numeric columns only
+        for col in self.numeric_columns:
+            if col in _RESERVED_COLUMNS:
+                continue
+            b = _to_float(buy_row.get(col))
+            s = _to_float(sell_row.get(col))
             try:
                 row[f"delta_{col}"] = float(s) - float(b)
             except Exception:
@@ -293,45 +401,63 @@ class OptionPermutationProcessor:
 
         return row
 
-    def _insert_rows(self, conn, rows):
+    def _insert_with_retries(self, conn: sqlite3.Connection, rows: List[Dict]):
+        """
+        Insert rows into PERM_TABLE using parameterized executemany.
+        Retries on sqlite3.OperationalError with exponential backoff.
+        """
         if not rows:
             return
 
         columns = list(rows[0].keys())
         placeholders = ",".join(["?"] * len(columns))
         sql = f"INSERT OR REPLACE INTO {self.PERM_TABLE} ({','.join(columns)}) VALUES ({placeholders});"
+        values = [tuple(row.get(c) for c in columns) for row in rows]
 
-        values = [tuple(row[c] for c in columns) for row in rows]
-
-        attempts = 5
-        for attempt in range(attempts):
+        attempt = 0
+        while attempt < self.insert_retries:
             try:
+                conn.execute("BEGIN;")
                 conn.executemany(sql, values)
-                conn.commit()
+                conn.execute("COMMIT;")
                 self._total_rows_inserted += len(values)
                 self._commit_count += 1
-                # run ANALYZE occasionally to keep query planner stats fresh
+
+                # ANALYZE occasionally to keep planner stats fresh
                 if (self._commit_count % self.analyze_after_commits) == 0:
                     try:
                         conn.execute("ANALYZE;")
                     except Exception:
                         pass
-                # attempt VACUUM if it's been long enough (rarely)
+
+                # VACUUM rarely (skip if busy)
                 if not self._last_vacuum or (datetime.utcnow() - self._last_vacuum) > self.vacuum_interval:
                     try:
-                        # VACUUM takes a lock; only run if database small or during quiet hours
                         conn.execute("VACUUM;")
                         self._last_vacuum = datetime.utcnow()
                     except Exception:
-                        # if busy, skip and try later
+                        # skip if DB is busy or VACUUM can't acquire lock
                         pass
+
                 return
             except sqlite3.OperationalError as e:
-                self.logger.logMessage(f"[Permutation] SQLite operational error on insert (attempt {attempt+1}): {e}")
-                time.sleep(0.1 * (attempt + 1))
+                # rollback if transaction left open
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                attempt += 1
+                sleep_time = DEFAULT_INSERT_RETRY_BACKOFF * attempt
+                logger.logMessage(f"[Permutation] SQLite OperationalError (attempt {attempt}): {e}; retrying in {sleep_time:.2f}s")
+                time.sleep(sleep_time)
             except Exception as e:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
                 self._last_error = str(e)
-                self.logger.logMessage(f"[Permutation] Unexpected error during insert: {e}")
+                logger.logMessage(f"[Permutation] Unexpected insert error: {e}")
                 raise
 
+        # If we fell out of loop, raise
         raise RuntimeError("Failed to insert permutation rows after retries.")
