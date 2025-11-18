@@ -281,8 +281,8 @@ class OptionPermutationProcessor:
         return [r[0] for r in cur.fetchall()]
 
     def _process_batch(self):
-        conn = self._get_conn()
         try:
+            conn = self._get_conn()
             conn.row_factory = sqlite3.Row
             osi_batch = self._fetch_osi_batch(conn)
             if not osi_batch:
@@ -299,7 +299,8 @@ class OptionPermutationProcessor:
         finally:
             try:
                 conn.close()
-            except Exception:
+            except Exception as e:
+                logger.logMessage(f"Error Processing batch: {e}")
                 pass
 
     def _process_single_osi(self, conn: sqlite3.Connection, osi: str):
@@ -322,7 +323,8 @@ class OptionPermutationProcessor:
             except Exception:
                 try:
                     conn.execute("ROLLBACK;")
-                except Exception:
+                except Exception as e:
+                    logger.logMessage(f"Error Processing single OSI: {e}")
                     pass
             return
 
@@ -346,7 +348,8 @@ class OptionPermutationProcessor:
         except Exception:
             try:
                 conn.execute("ROLLBACK;")
-            except Exception:
+            except Exception as e:
+                logger.logMessage(f"Error Processing single OSI: {e}")
                 pass
 
     def _build_perm_row(self, osi: str, buy_row: Dict, sell_row: Dict) -> Dict:
