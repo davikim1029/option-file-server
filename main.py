@@ -27,8 +27,10 @@ UVICORN_CMD = [
     "option_server:app",
     "--host", "0.0.0.0",
     "--port", "8000",
-    "--log-level", "info"
+    "--log-level", "info",
+    "--lifespan", "on"
 ]
+
 
 RESTART_DELAY = 2  # seconds before auto-restart if crashed
 
@@ -71,6 +73,7 @@ def start_server():
             UVICORN_CMD,
             stdout=log_file,
             stderr=log_file,
+            start_new_session=True
         )
     PID_FILE.write_text(str(process.pid))
     print(f"Server started with PID {process.pid}, logging to {LOG_FILE}")
@@ -117,6 +120,7 @@ def monitor_loop():
                 UVICORN_CMD,
                 stdout=log_file,
                 stderr=log_file,
+                start_new_session=True
             )
             PID_FILE.write_text(str(process.pid))
             process.wait()  # Wait until server exits
