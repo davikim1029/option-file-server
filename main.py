@@ -7,7 +7,6 @@ import time
 from logging import FileHandler
 from collections import deque
 from shared_options.log.logger_singleton import getLogger
-from processors.lifetime_processor import get_summary
 from analytics.stats import stats
 
 logger = getLogger()
@@ -171,9 +170,7 @@ def main():
             stats()
         elif choice == "6":
             tail_log(LOG_FILE)
-            
-        elif choice == "7":
-            get_summary(DB_PATH)
+
         elif choice == "8":
             break
         else:

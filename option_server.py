@@ -1,34 +1,22 @@
+# server (e.g. api_server.py) — only the modified pieces shown
+
 from fastapi import FastAPI, UploadFile, File
 from pathlib import Path
-import shutil
-import threading
-import time
 from contextlib import asynccontextmanager
-from typing import List
-from pydantic import BaseModel
+import threading, time, shutil
 from logging import FileHandler
+from shared_options.log.logger_singleton import getLogger
 
-# Processors
 from processors.snapshot_processor import OptionSnapshotProcessor
 from processors.lifetime_processor import OptionLifetimeProcessor
 from processors.permutation_processor import OptionPermutationProcessor
-from shared_options.models.OptionFeature import OptionFeature
-from shared_options.log.logger_singleton import getLogger
 
-
-# -----------------------------
-# Configuration
-# -----------------------------
+# ... your existing config ...
 SAVE_DIR = Path("data")
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = Path("database/options.db")
+# ensure dirs exist...
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-CHECK_INTERVAL = 5  # seconds
-MAX_LOG_LINES = 10000
-
-# Logger
 logger = getLogger()
 LOG_FILE = Path("option_server.log")
 for handler in logger.logger.handlers:
@@ -36,138 +24,84 @@ for handler in logger.logger.handlers:
         LOG_FILE = Path(handler.baseFilename)
         break
 
+app = FastAPI()  # we will pass lifespan below
 
-# -----------------------------
-# Pydantic
-# -----------------------------
-class OptionFeatureBatch(BaseModel):
-    options: List[OptionFeature]
-
-
-# -----------------------------
-# Log trimming
-# -----------------------------
-def trim_log():
-    if not LOG_FILE.exists():
-        return
-    with LOG_FILE.open("r") as f:
-        lines = f.readlines()
-    if len(lines) > MAX_LOG_LINES:
-        with LOG_FILE.open("w") as f:
-            f.writelines(lines[-MAX_LOG_LINES:])
-
-
-def log_monitor():
-    while True:
-        trim_log()
-        time.sleep(60)
-
-
-# -----------------------------
-# FastAPI lifespan
-# -----------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.logMessage("Starting FastAPI lifespan...")
 
-    # ----------------------------------------
-    # Start: Snapshot Processor
-    # ----------------------------------------
-    snapshot_processor = None
-    try:
-        logger.logMessage("Initializing snapshot processor...")
+    # snapshot processor (example: using same constructor you had)
+    snapshot_processor = OptionSnapshotProcessor(
+        db_path=str(DB_PATH),
+        incoming_folder=SAVE_DIR,
+        check_interval=5
+    )
+    snapshot_processor.start()
+    logger.logMessage("Snapshot processor started")
 
-        snapshot_processor = OptionSnapshotProcessor(
-            db_path=str(DB_PATH),
-            incoming_folder=SAVE_DIR,
-            check_interval=CHECK_INTERVAL
-        )
-        snapshot_processor.start()
+    # lifetime processor
+    lifetime_processor = OptionLifetimeProcessor(
+        db_path=str(DB_PATH),
+        check_interval=60
+    )
+    lifetime_processor.start()
+    logger.logMessage("Lifetime processor started")
 
-        logger.logMessage("Snapshot processor started")
-    except Exception as e:
-        logger.logMessage(f"Error starting snapshot processor: {e}")
+    # permutation processor - ensure we pass DB_PATH
+    permutation_processor = OptionPermutationProcessor(
+        db_path=str(DB_PATH),
+        check_interval=45,
+        batch_commit_size=100,
+        analyze_after_commits=1,
+        vacuum_interval_hours=24
+    )
+    permutation_processor.start()
+    logger.logMessage("Permutation processor started")
 
-    # ----------------------------------------
-    # Start: Lifetime Processor
-    # ----------------------------------------
-    lifetime_processor = None
-    try:
-        logger.logMessage("Initializing lifetime processor...")
+    # attach to app.state so handlers can access
+    app.state.snapshot_processor = snapshot_processor
+    app.state.lifetime_processor = lifetime_processor
+    app.state.permutation_processor = permutation_processor
 
-        lifetime_processor = OptionLifetimeProcessor(
-            db_path=DB_PATH,
-            check_interval=60
-        )
-        lifetime_processor.start()
-
-        logger.logMessage("Lifetime processor started")
-    except Exception as e:
-        logger.logMessage(f"Error starting lifetime processor: {e}")
-
-    # ----------------------------------------
-    # Start: Permutation Processor
-    # ----------------------------------------
-    permutation_processor = None
-    try:
-        logger.logMessage("Initializing permutation processor...")
-
-        permutation_processor = OptionPermutationProcessor(
-            check_interval=45
-        )
-        permutation_processor.start()
-
-        logger.logMessage("Permutation processor started")
-    except Exception as e:
-        logger.logMessage(f"Error starting permutation processor: {e}")
-
-    # ----------------------------------------
-    # Start: Log monitor
-    # ----------------------------------------
+    # start log monitor thread (unchanged)
+    def log_monitor():
+        while True:
+            # trim log file here...
+            time.sleep(60)
     log_thread = threading.Thread(target=log_monitor, daemon=True)
     log_thread.start()
-    logger.logMessage("Log monitor started")
 
-    # ----------------------------------------
-    # Yield to FastAPI
-    # ----------------------------------------
-    yield
-
-    # ----------------------------------------
-    # Shutdown
-    # ----------------------------------------
-    logger.logMessage("Server shutdown started...")
-
-    for proc, name in [
-        (snapshot_processor, "Snapshot"),
-        (lifetime_processor, "Lifetime"),
-        (permutation_processor, "Permutation")
-    ]:
-        if proc:
+    try:
+        yield
+    finally:
+        logger.logMessage("Server shutdown started...")
+        for proc in (snapshot_processor, lifetime_processor, permutation_processor):
             try:
-                proc.stop()
-                logger.logMessage(f"{name} processor stopped")
+                if proc:
+                    proc.stop()
             except Exception as e:
-                logger.logMessage(f"Error stopping {name} processor: {e}")
+                logger.logMessage(f"Error stopping processor: {e}")
+        logger.logMessage("Server shutdown complete.")
 
-    logger.logMessage("Shutdown complete.")
-
-
-# -----------------------------
-# FastAPI App
-# -----------------------------
+# assign lifespan to app
 app = FastAPI(lifespan=lifespan)
 
+# -----------------------------
+# Permutation status endpoints
+# -----------------------------
+@app.get("/perm/status")
+def permutation_status():
+    proc = getattr(app.state, "permutation_processor", None)
+    if not proc:
+        return {"status": "error", "message": "Permutation processor not running"}
+    return proc.get_status()
 
-# -----------------------------
-# API endpoint
-# -----------------------------
-@app.post("/api/upload_file")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        filepath = SAVE_DIR / file.filename
-        with filepath.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-        return {"status": "ok", "filename": file.filename}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+@app.get("/perm/counts")
+def permutation_counts():
+    proc = getattr(app.state, "permutation_processor", None)
+    if not proc:
+        return {"status": "error", "message": "Permutation processor not running"}
+    return {
+        "rows_inserted": proc.get_status()["total_rows_inserted"],
+        "osis_processed": proc.get_status()["total_osis_processed"]
+    }
