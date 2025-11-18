@@ -11,13 +11,60 @@ from processors.snapshot_processor import OptionSnapshotProcessor
 from processors.lifetime_processor import OptionLifetimeProcessor
 from processors.permutation_processor import OptionPermutationProcessor
 
-# ... your existing config ...
+# --- DEBUG INSTRUMENTATION: signal + exception + thread hooks ----------------
+import sys
+import signal
+import traceback
+import threading
+from shared_options.log.logger_singleton import getLogger
+
+logger = getLogger()
+
+def _log_unhandled(exc_type, exc_value, exc_tb):
+    try:
+        logger.logMessage("[CRASH HOOK] Unhandled exception:\n" + "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    except Exception:
+        print("Failed to log unhandled exception", file=sys.stderr)
+    # keep default behavior (optional): sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _log_unhandled
+
+# Python 3.8+: threading.excepthook exists; otherwise we can wrap thread targets
+if hasattr(threading, "excepthook"):
+    def _thread_excepthook(args):
+        try:
+            logger.logMessage(f"[THREAD CRASH] Thread {args.thread.name} crashed with exception:\n{args.exc_type.__name__}: {args.exc_value}\n" + "".join(traceback.format_tb(args.exc_traceback)))
+        except Exception:
+            print("Failed to log thread exception", file=sys.stderr)
+    threading.excepthook = _thread_excepthook
+else:
+    # For older versions, consider wrapping thread target functions (we do that in processors already)
+    pass
+
+def _signal_handler(signum, frame):
+    try:
+        logger.logMessage(f"[SIGNAL] Received signal {signum} ({signal.Signals(signum).name if hasattr(signal, 'Signals') else signum}); initiating shutdown trace.")
+        logger.logMessage("Stack trace at signal:\n" + "".join(traceback.format_stack(frame)))
+    except Exception:
+        print("Failed to log signal handler", file=sys.stderr)
+    # do not call sys.exit here; let uvicorn handle graceful shutdown
+
+# Register common signals
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    try:
+        signal.signal(sig, _signal_handler)
+    except Exception:
+        # some environments (Windows) may not support all signals
+        pass
+# ---------------------------------------------------------------------------
+
+
+
 SAVE_DIR = Path("data")
 DB_PATH = Path("database/options.db")
 # ensure dirs exist...
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-logger = getLogger()
 LOG_FILE = Path("option_server.log")
 for handler in logger.logger.handlers:
     if isinstance(handler, FileHandler):
