@@ -84,17 +84,23 @@ def stop_server():
         return
 
     pid = int(PID_FILE.read_text())
+
     try:
-        os.kill(pid, signal.SIGTERM)
-        print(f"Sent SIGTERM to server PID {pid}")
-        # wait for process to terminate
-        for _ in range(10):
-            time.sleep(0.5)
-            os.kill(pid, 0)
+        # Kill entire session (process group)
+        os.killpg(pid, signal.SIGTERM)
+        print(f"Sent SIGTERM to entire process group for PID {pid}")
+
+        # Wait for processes to shut down
+        time.sleep(1)
+
     except ProcessLookupError:
         print(f"No process with PID {pid} found.")
+    except PermissionError:
+        print("Permission error sending kill to process group")
+
     PID_FILE.unlink(missing_ok=True)
     print("Server stopped.")
+
 
 def check_server():
     if is_server_running():
