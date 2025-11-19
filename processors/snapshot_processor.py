@@ -1,19 +1,25 @@
+# processors/snapshot_processor.py
+"""
+OptionSnapshotProcessor
+- Watches a folder for JSON snapshot files and ingests them into option_snapshots.
+- Uses short-lived DB connections with WAL and busy_timeout to reduce lock contention.
+- Inserts per-file are run inside a single short transaction (BEGIN IMMEDIATE).
+"""
+
+import json
+import sqlite3
 import threading
 import time
-import sqlite3
-from pathlib import Path
-import json
 from datetime import datetime
-from typing import Union
+from pathlib import Path
+from typing import Union, Optional
 
-from shared_options.models.OptionFeature import OptionFeature
 from shared_options.log.logger_singleton import getLogger
 from logging import FileHandler
 
-
 logger = getLogger()
 
-# Resolve actual log file from logger
+# resolve log file for context (used by old code; kept for compatibility)
 LOG_FILE = Path("option_server.log")
 for handler in logger.logger.handlers:
     if isinstance(handler, FileHandler):
@@ -22,43 +28,51 @@ for handler in logger.logger.handlers:
 
 
 class OptionSnapshotProcessor(threading.Thread):
-    """
-    Background processor that watches a folder and ingests snapshot files
-    into the option_snapshots database.
-    """
-
     def __init__(
         self,
         db_path: Union[str, Path],
         incoming_folder: Union[str, Path],
-        check_interval: int = 30
+        check_interval: int = 30,
+        sqlite_timeout: float = 30.0
     ):
-        super().__init__(daemon=True)
-
+        super().__init__(daemon=True, name="OptionSnapshotProcessor")
         self.db_path = Path(db_path)
         self.folder = Path(incoming_folder)
-        self.check_interval = check_interval
+        self.check_interval = int(check_interval)
+        self.sqlite_timeout = float(sqlite_timeout)
+
+        self._stop_event = threading.Event()
 
         # ensure necessary paths exist
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.folder.mkdir(parents=True, exist_ok=True)
 
-        self._stop_event = threading.Event()
-        self.logger = logger
-
+        # initialize schema
         self._init_db()
 
-    # ----------------------------------------------------------------------
-    # Database Init
-    # ----------------------------------------------------------------------
-    def _init_db(self):
-        """Creates the option_snapshots table if missing."""
+    # -------------------------
+    # DB helper (short-lived connections)
+    # -------------------------
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=self.sqlite_timeout, isolation_level=None)
         try:
-            self.logger.logMessage("[SnapshotProcessor] Checking/creating option_snapshots table")
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")  # 30 seconds
+        except Exception:
+            # ignore on constrained builds
+            pass
+        return conn
 
-            c.execute("""
+    # -------------------------
+    # Table init
+    # -------------------------
+    def _init_db(self) -> None:
+        try:
+            logger.logMessage("[SnapshotProcessor] Checking/creating option_snapshots table")
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS option_snapshots (
                     osiKey TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
@@ -85,108 +99,133 @@ class OptionSnapshotProcessor(threading.Thread):
                     midPrice REAL,
                     moneyness REAL,
                     PRIMARY KEY (osiKey, timestamp)
-                )
+                );
             """)
-
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_option_snapshots_osi ON option_snapshots(osiKey);")
             conn.commit()
             conn.close()
-            self.logger.logMessage("[SnapshotProcessor] option_snapshots table ready")
-
+            logger.logMessage("[SnapshotProcessor] option_snapshots table ready")
         except Exception as e:
-            self.logger.logMessage("[SnapshotProcessor] DB init error")
-            self.logger.logMessage(e)
+            logger.logMessage("[SnapshotProcessor] DB init error")
+            logger.logMessage(str(e))
 
-    # ----------------------------------------------------------------------
-    # Thread Control
-    # ----------------------------------------------------------------------
+    # -------------------------
+    # Thread control
+    # -------------------------
     def stop(self):
-        """Signal the background thread to stop cleanly."""
         self._stop_event.set()
 
-    # ----------------------------------------------------------------------
-    # Thread Run Loop
-    # ----------------------------------------------------------------------
     def run(self):
-        self.logger.logMessage("[SnapshotProcessor] Started")
-
+        logger.logMessage("[SnapshotProcessor] Started")
         while not self._stop_event.is_set():
             try:
-                # process files
-                for file in self.folder.glob("*.json"):
+                for file in list(self.folder.glob("*.json")):
                     try:
-                        self.logger.logMessage(f"[SnapshotProcessor] Processing {file.name}")
+                        logger.logMessage(f"[SnapshotProcessor] Processing {file.name}")
                         self.ingest_file(file)
-                        file.unlink(missing_ok=True)
+                        try:
+                            file.unlink(missing_ok=True)
+                        except Exception:
+                            logger.logMessage(f"[SnapshotProcessor] Failed to unlink {file.name}")
                     except Exception as e:
-                        self.logger.logMessage(f"[SnapshotProcessor] Error processing {file.name}")
-                        self.logger.logMessage(e)
-
-                # sleep between cycles
+                        logger.logMessage(f"[SnapshotProcessor] Error processing {file.name}: {e}")
                 time.sleep(self.check_interval)
-
             except Exception as e:
-                self.logger.logMessage("[SnapshotProcessor] Loop crash (recovering)")
-                self.logger.logMessage(e)
+                logger.logMessage("[SnapshotProcessor] Loop crash (recovering)")
+                logger.logMessage(str(e))
                 time.sleep(5)
+        logger.logMessage("[SnapshotProcessor] Stopped")
 
-        self.logger.logMessage("[SnapshotProcessor] Stopped")
-
-    # ----------------------------------------------------------------------
-    # Ingestion Logic
-    # ----------------------------------------------------------------------
-    def ingest_file(self, file_path: Union[str, Path]):
-        """Read JSON snapshot file and store in the DB."""
+    # -------------------------
+    # Ingest single file with its own short transaction
+    # -------------------------
+    def ingest_file(self, file_path: Union[str, Path]) -> None:
         file_path = Path(file_path)
-        self.logger.logMessage(f"[SnapshotProcessor] Ingesting {file_path.name}")
-
         if not file_path.exists():
-            self.logger.logMessage(f"[SnapshotProcessor] File not found: {file_path.name}")
+            logger.logMessage(f"[SnapshotProcessor] File not found: {file_path}")
             return
 
         try:
             with file_path.open("r") as f:
                 data = json.load(f)
         except Exception as e:
-            self.logger.logMessage(f"[SnapshotProcessor] JSON load error for {file_path.name}")
-            self.logger.logMessage(e)
+            logger.logMessage(f"[SnapshotProcessor] JSON load error for {file_path.name}: {e}")
             return
 
         if not data:
-            self.logger.logMessage(f"[SnapshotProcessor] Empty JSON file: {file_path.name}")
+            logger.logMessage(f"[SnapshotProcessor] Empty JSON file: {file_path.name}")
             return
 
+        conn: Optional[sqlite3.Connection] = None
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
+            conn = self._get_conn()
+            cur = conn.cursor()
 
+            cols = (
+                "osiKey", "timestamp", "symbol", "optionType", "strikePrice",
+                "lastPrice", "bid", "ask", "bidSize", "askSize", "volume", "openInterest",
+                "nearPrice", "inTheMoney", "delta", "gamma", "theta", "vega", "rho", "iv",
+                "daysToExpiration", "spread", "midPrice", "moneyness"
+            )
+            placeholders = ", ".join(["?"] * len(cols))
+            sql = f"INSERT OR REPLACE INTO option_snapshots ({', '.join(cols)}) VALUES ({placeholders});"
+
+            # Do the entire file insert in a short transaction
+            conn.execute("BEGIN IMMEDIATE;")
             for entry in data:
-                option = OptionFeature(**entry)
-
-                ts = getattr(option, "timestamp", None)
+                # Defensive timestamp handling — mirror previous behavior
+                ts = entry.get("timestamp")
                 if ts is None:
                     ts = datetime.utcnow().isoformat()
                 elif isinstance(ts, datetime):
                     ts = ts.isoformat()
 
-                c.execute("""
-                    INSERT OR REPLACE INTO option_snapshots (
-                        osiKey, timestamp, symbol, optionType, strikePrice,
-                        lastPrice, bid, ask, bidSize, askSize, volume, openInterest,
-                        nearPrice, inTheMoney, delta, gamma, theta, vega, rho, iv,
-                        daysToExpiration, spread, midPrice, moneyness
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    option.osiKey, ts, option.symbol, option.optionType, option.strikePrice,
-                    option.lastPrice, option.bid, option.ask, option.bidSize, option.askSize,
-                    option.volume, option.openInterest, option.nearPrice, option.inTheMoney,
-                    option.delta, option.gamma, option.theta, option.vega, option.rho, option.iv,
-                    option.daysToExpiration, option.spread, option.midPrice, option.moneyness
-                ))
-
-            conn.commit()
-            conn.close()
-            self.logger.logMessage(f"[SnapshotProcessor] {file_path.name} added to DB")
-
+                params = (
+                    entry.get("osiKey"),
+                    ts,
+                    entry.get("symbol"),
+                    entry.get("optionType"),
+                    entry.get("strikePrice"),
+                    entry.get("lastPrice"),
+                    entry.get("bid"),
+                    entry.get("ask"),
+                    entry.get("bidSize"),
+                    entry.get("askSize"),
+                    entry.get("volume"),
+                    entry.get("openInterest"),
+                    entry.get("nearPrice"),
+                    entry.get("inTheMoney"),
+                    entry.get("delta"),
+                    entry.get("gamma"),
+                    entry.get("theta"),
+                    entry.get("vega"),
+                    entry.get("rho"),
+                    entry.get("iv"),
+                    entry.get("daysToExpiration"),
+                    entry.get("spread"),
+                    entry.get("midPrice"),
+                    entry.get("moneyness"),
+                )
+                cur.execute(sql, params)
+            conn.execute("COMMIT;")
+            logger.logMessage(f"[SnapshotProcessor] {file_path.name} added to DB (thread={threading.current_thread().name})")
+        except sqlite3.OperationalError as e:
+            try:
+                if conn:
+                    conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+            logger.logMessage(f"[SnapshotProcessor] DB OperationalError ingesting {file_path.name}: {e}")
         except Exception as e:
-            self.logger.logMessage(f"[SnapshotProcessor] DB insert error for {file_path.name}")
-            self.logger.logMessage(e)
+            try:
+                if conn:
+                    conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+            logger.logMessage(f"[SnapshotProcessor] DB insert error for {file_path.name}: {e}")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
