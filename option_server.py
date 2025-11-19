@@ -71,7 +71,10 @@ for handler in logger.logger.handlers:
         LOG_FILE = Path(handler.baseFilename)
         break
 
+from routes.files_api import router as files_router
+
 app = FastAPI()  # we will pass lifespan below
+app.include_router(files_router)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
