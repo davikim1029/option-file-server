@@ -5,6 +5,9 @@ import subprocess
 import signal
 from pathlib import Path
 import time
+import socket
+import psutil
+
 from logging import FileHandler
 from collections import deque
 from shared_options.log.logger_singleton import getLogger
@@ -15,7 +18,9 @@ logger = getLogger()
 # -----------------------------
 # Paths & Constants
 # -----------------------------
+PORT = "8000"
 PID_FILE = Path("option_server.pid")
+APP_NAME_FRAGMENT = "option_server"
 DB_PATH = Path("database/options.db")
 
 # Max log file size 5 MB, keep 3 backups
@@ -25,9 +30,9 @@ BACKUP_COUNT = 3
 # uvicorn command to start FastAPI server
 UVICORN_CMD = [
     sys.executable, "-m", "uvicorn",
-    "option_server:app",
+    f"{APP_NAME_FRAGMENT}:app",
     "--host", "0.0.0.0",
-    "--port", "8000",
+    f"--port", {PORT},
     "--log-level", "info",
     "--lifespan", "on"
 ]
@@ -90,6 +95,7 @@ def stop_server():
         # Kill entire session (process group)
         os.killpg(pid, signal.SIGTERM)
         print(f"Sent SIGTERM to entire process group for PID {pid}")
+        cleanup_previous_instance()
 
         # Wait for processes to shut down
         time.sleep(1)
@@ -186,6 +192,66 @@ def main():
             break
         else:
             print("Invalid choice, try again.")
+            
+            
+
+
+def get_process_using_port(port: int):
+    """Return psutil.Process using this TCP port, or None."""
+    for conn in psutil.net_connections(kind='inet'):
+        if conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+            try:
+                return psutil.Process(conn.pid)
+            except Exception:
+                pass
+    return None
+
+def kill_process_using_port(port: int):
+    proc = get_process_using_port(port)
+    if not proc:
+        return False
+
+    print(f"[CLEANUP] Killing process on port {port}: PID={proc.pid}, NAME={proc.name()}")
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except psutil.TimeoutExpired:
+        proc.kill()
+    return True
+def kill_processes_by_name(name_fragment: str):
+    """
+    Kill processes where the executable or cmdline contains name_fragment.
+    """
+    killed = 0
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            text = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else proc.info['name']
+            if text and name_fragment.lower() in text.lower():
+                print(f"[CLEANUP] Killing process: PID={proc.pid}, NAME={proc.info['name']}")
+                proc.terminate()
+                killed += 1
+        except Exception:
+            continue
+    
+    return killed
+def cleanup_previous_instance():
+    # 1: Kill anything using port
+    kill_process_using_port(PORT)
+
+    # 2: Kill anything with our app's name
+    kill_processes_by_name(APP_NAME_FRAGMENT)
+
+    # 3: Remove orphaned PID file
+    if PID_FILE.exists():
+        try:
+            with PID_FILE.open() as f:
+                old_pid = int(f.read().strip())
+            print(f"[CLEANUP] PID file detected, killing old PID={old_pid}")
+            os.kill(old_pid, 9)
+        except Exception:
+            pass
+        PID_FILE.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     main()
