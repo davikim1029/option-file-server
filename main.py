@@ -32,7 +32,7 @@ UVICORN_CMD = [
     sys.executable, "-m", "uvicorn",
     f"{APP_NAME_FRAGMENT}:app",
     "--host", "0.0.0.0",
-    f"--port", {PORT},
+    f"--port", PORT,
     "--log-level", "info",
     "--lifespan", "on"
 ]

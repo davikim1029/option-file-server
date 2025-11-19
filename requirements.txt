@@ -7,3 +7,4 @@ pandas>=2.0
 APScheduler>=3.10
 watchdog>=3.0  # if you want live folder watching
 fastapi
+psutil
